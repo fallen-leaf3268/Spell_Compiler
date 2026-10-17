@@ -1,0 +1,195 @@
+plugins {
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'org.spongepowered.mixin' version '0.7.+'
+    id 'org.parchmentmc.librarian.forgegradle' version '1.+'
+    id 'idea'
+}
+
+version = mod_version
+group = mod_group_id
+base { archivesName = mod_id }
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+jarJar.enable()
+
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+    copyIdeResources = true
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.console.level', 'info'
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.console.level', 'info'
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
+        gameTestServer {
+            workingDirectory project.file('build/gametest-run')
+            property 'forge.enabledGameTestNamespaces', 'spell_compiler_formula'
+            property 'forge.logging.console.level', 'info'
+            property 'spell_compiler.formulaProbe', 'true'
+            mods { "${mod_id}" { source sourceSets.main; source sourceSets.test } }
+        }
+    }
+}
+
+sourceSets.main.resources {
+    srcDir 'src/main/mixins'
+    srcDir 'build/generated/formula-resources'
+}
+sourceSets.main.java { srcDir 'build/generated/formula-mixins' }
+sourceSets.test.resources { srcDir 'build/gametest-resources' }
+
+def formulaSourceJar = layout.projectDirectory.file("libs/ironsspells-${ironsspells_version}.jar")
+def formulaTargets = layout.buildDirectory.file('generated/formula-targets.json')
+def formulaCatalogTargets = layout.buildDirectory.file('generated/formula-catalog-targets.json')
+def formulaMixinSource = layout.buildDirectory.file('generated/formula-mixins/com/example/spell_compiler/mixin/formula/GeneratedSpellFormulaMixin.java')
+def formulaCatalog = layout.buildDirectory.file('generated/formula-resources/formula/ironsspells-3.16.1-catalog.json')
+def formulaExtraTargets = ['ThunderstormEffect', 'FrostbiteEffect', 'GluttonyEffect', 'OakskinEffect', 'SpiderAspectEffect']
+        .collect { "io.redspace.ironsspellbooks.effect.${it}".toString() }
+
+tasks.register('generateFormulaMixin') {
+    inputs.file(formulaSourceJar)
+    inputs.property('formulaSiteTargets', formulaExtraTargets)
+    outputs.files(formulaTargets, formulaMixinSource)
+    doLast {
+        def targets
+        new java.util.jar.JarFile(formulaSourceJar.asFile).withCloseable { jar ->
+            targets = jar.stream().filter { entry ->
+                entry.name.startsWith('io/redspace/ironsspellbooks/spells/') &&
+                        entry.name.substring('io/redspace/ironsspellbooks/spells/'.length()).contains('/') &&
+                        entry.name.endsWith('.class') && !entry.name.contains('$')
+            }.map { entry -> entry.name.substring(0, entry.name.length() - 6).replace('/', '.') }.sorted().toList()
+        }
+        targets = (targets + formulaExtraTargets).unique().sort()
+        def indexFile = formulaTargets.get().asFile
+        indexFile.parentFile.mkdirs()
+        indexFile.setText(groovy.json.JsonOutput.toJson(targets), 'UTF-8')
+        def sourceFile = formulaMixinSource.get().asFile
+        sourceFile.parentFile.mkdirs()
+        def annotations = targets.collect { '        "' + it + '"' }.join(',\n')
+        sourceFile.setText('package com.example.spell_compiler.mixin.formula;\n\n' +
+                '@org.spongepowered.asm.mixin.Pseudo\n' +
+                '@org.spongepowered.asm.mixin.Mixin(targets = {\n' + annotations + '\n}, remap = false, priority = 1100)\n' +
+                'public abstract class GeneratedSpellFormulaMixin {}\n', 'UTF-8')
+    }
+}
+
+tasks.named('compileJava').configure { dependsOn('generateFormulaMixin') }
+tasks.register('generateFormulaCatalog', JavaExec) {
+    dependsOn('compileJava')
+    inputs.file(formulaSourceJar)
+    inputs.files(sourceSets.main.output.classesDirs)
+    outputs.files(formulaCatalog, formulaCatalogTargets)
+    classpath = sourceSets.main.output.classesDirs + configurations.runtimeClasspath
+    mainClass = 'com.example.spell_compiler.formula.FormulaCatalogGenerator'
+    doFirst {
+        args = [formulaSourceJar.asFile.absolutePath, formulaCatalog.get().asFile.absolutePath, formulaCatalogTargets.get().asFile.absolutePath]
+    }
+}
+tasks.named('processResources').configure { dependsOn('generateFormulaCatalog') }
+
+repositories {
+    mavenCentral {
+        content {
+            excludeGroup 'net.minecraft'
+            excludeGroup 'net.minecraftforge'
+            excludeGroup 'de.oceanlabs.mcp'
+            excludeGroupByRegex 'org\\.parchmentmc(\\..*)?'
+        }
+    }
+    flatDir { dir 'libs'; content { includeGroup 'libs' } }
+    maven { url = 'https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/'; content { includeGroup 'software.bernie.geckolib' } }
+    maven { url = 'https://maven.kosmx.dev/'; content { includeGroup 'dev.kosmx.player-anim' } }
+    maven { url = 'https://code.redspace.io/releases'; content { includeGroup 'io.redspace' } }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    annotationProcessor "org.spongepowered:mixin:${mixin_version}:processor"
+    compileOnly(annotationProcessor("io.github.llamalad7:mixinextras-common:${mixinextras_version}"))
+    compileOnly 'org.ow2.asm:asm-analysis:9.5'
+    implementation(jarJar("io.github.llamalad7:mixinextras-forge:${mixinextras_version}")) {
+        jarJar.ranged(it, "[${mixinextras_version},)")
+    }
+    implementation fg.deobf("libs:curios:${libs_version}")
+    implementation fg.deobf("libs:ironsspells:${ironsspells_version}")
+    runtimeOnly fg.deobf("software.bernie.geckolib:geckolib-forge-${geckolib_version}")
+    runtimeOnly fg.deobf("dev.kosmx.player-anim:player-animation-lib-forge:${player_animator_version}")
+    runtimeOnly fg.deobf("io.redspace:irons_lib:${irons_lib_version}")
+    testImplementation platform("org.junit:junit-bom:${junit_version}")
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation fg.deobf("software.bernie.geckolib:geckolib-forge-${geckolib_version}")
+}
+
+mixin {
+    add sourceSets.main, 'spell_compiler.refmap.json'
+    config 'spell_compiler.mixins.json'
+    config 'spell_compiler.formulas.mixins.json'
+}
+
+def replaceProperties = [
+    minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
+    forge_version: forge_version, forge_version_range: forge_version_range,
+    loader_version_range: loader_version_range,
+    mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
+    mod_authors: mod_authors, mod_description: mod_description,
+    ironsspells_version_range: ironsspells_version_range
+]
+processResources {
+    filteringCharset = 'UTF-8'
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) { expand replaceProperties }
+}
+
+jar {
+    manifest {
+        attributes([
+            'Specification-Title': mod_name,
+            'Specification-Vendor': mod_authors,
+            'Specification-Version': '1',
+            'Implementation-Title': project.name,
+            'Implementation-Version': project.jar.archiveVersion,
+            'Implementation-Vendor': mod_authors,
+            'MixinConfigs': 'spell_compiler.formulas.mixins.json,spell_compiler.mixins.json'
+        ])
+    }
+}
+jar.finalizedBy('reobfJar')
+reobf { jarJar {} }
+tasks.named('jar').configure { archiveClassifier.set('slim') }
+tasks.named('jarJar').configure { archiveClassifier.set(''); finalizedBy('reobfJarJar') }
+tasks.named('build').configure { dependsOn('jarJar') }
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.named('test', Test).configure { useJUnitPlatform() }
+
+tasks.register('prepareGameTestTemplate') {
+    def targets = ['spell_compiler', 'spell_compiler_formula', 'spell_compiler_formula_remote'].collect {
+        layout.buildDirectory.file("gametest-resources/data/${it}/structures/empty.nbt")
+    }
+    outputs.files(targets)
+    doLast {
+        targets.each { output ->
+            def target = output.get().asFile
+            target.parentFile.mkdirs()
+            new DataOutputStream(new java.util.zip.GZIPOutputStream(new FileOutputStream(target))).withCloseable { data ->
+                data.writeByte(10); data.writeUTF('')
+                data.writeByte(3); data.writeUTF('DataVersion'); data.writeInt(3465)
+                data.writeByte(9); data.writeUTF('size'); data.writeByte(3); data.writeInt(3)
+                3.times { data.writeInt(3) }
+                data.writeByte(9); data.writeUTF('palette'); data.writeByte(10); data.writeInt(1)
+                data.writeByte(8); data.writeUTF('Name'); data.writeUTF('minecraft:air'); data.writeByte(0)
+                ['blocks', 'entities'].each { name ->
+                    data.writeByte(9); data.writeUTF(name); data.writeByte(10); data.writeInt(0)
+                }
+                data.writeByte(0)
+            }
+        }
+    }
+}
+tasks.named('processTestResources').configure { dependsOn('prepareGameTestTemplate') }
+if (providers.gradleProperty('formulaProbeDir').isPresent()) {
+    minecraft.runs.gameTestServer { workingDirectory file(providers.gradleProperty('formulaProbeDir').get()) }
+}

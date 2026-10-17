@@ -1,0 +1,7 @@
+{
+  "commands.spell_compiler.export_spells.failure": "The datapack was not fully exported: %1$s error(s). Check the server log. Directory: %2$s",
+  "commands.spell_compiler.export_spells.success": "Spell datapack exported to: %1$s. Existing files were preserved. Place the entire spell_compiler folder in the desired world's datapacks directory, then enable the datapack and run /reload.",
+  "disconnect.spell_compiler.formula_sync_failed": "Could not apply the server's spell formulas. Check the client log and mod versions.",
+  "pack.spell_compiler.spells": "Spell Compiler",
+  "pack.spell_compiler.resources": "Spell Compiler resources"
+}

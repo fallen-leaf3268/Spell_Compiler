@@ -1,0 +1,6 @@
+{
+    "pack": {
+        "description": { "translate": "pack.spell_compiler.resources" },
+        "pack_format": 15
+    }
+}
