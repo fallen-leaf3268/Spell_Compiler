@@ -22,17 +22,10 @@
 | `ironsspells-3.16.1.jar` | [Iron's Spells 'n Spellbooks](https://www.curseforge.com/minecraft/mc-mods/irons-spells-n-spellbooks) 1.20.1-3.16.1，Forge | `B847B5A0D0B8D81EBF9F21F29FEE9AD180A235B8BF983EFA902EB67FC1485862` |
 
 ```shell
-gradle test
 gradle jarJar
 ```
 
 生成的模组位于 `build/libs/spell_compiler-0.1.0.jar`。Mixin 目标、公式目录和 refmap 由构建任务生成。
-
-运行原生 Forge 功能测试：
-
-```shell
-gradle runGameTestServer
-```
 
 ## 使用
 
@@ -45,6 +38,8 @@ gradle runGameTestServer
 数据格式为 schema 4，网络协议为 10，联机双方应安装对应模组版本。玩家提示提供简体中文和英文翻译。
 
 ## 验证范围
+
+测试、GameTest 和调试探针仅保留在本地，不纳入本仓库。
 
 当前实现已通过 397 项单元测试、33 个原生 Forge 功能场景，以及真实词条桥接的 9 个场景、49 条严格观测。客户端主菜单检查覆盖 27 支附属法术接入和 21 项中英文文本解析。
 
