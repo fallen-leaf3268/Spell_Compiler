@@ -4,10 +4,15 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.MethodInsnNode;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.HashMap;
@@ -16,9 +21,16 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.HexFormat;
 import java.util.jar.JarFile;
 
 public final class FormulaClassRepository {
+    private FormulaExecutionGraph.Index executionGraph;
+    private record CachedDataFlow(MethodNode method, String fingerprint, FormulaDataFlow.Analysis analysis) {}
+    private final Map<FormulaDataFlow.MethodId, CachedDataFlow> dataFlows = new HashMap<>();
+    private final Map<String, FormulaMethodResolver.Resolution> invocations = new HashMap<>();
+    private final Map<String, List<ClassNode>> sourceSubtypes = new HashMap<>();
     public record ResolvedMethod(ClassNode owner, MethodNode method) {}
     public record ResolvedField(ClassNode owner, FieldNode field) {}
 
@@ -26,6 +38,9 @@ public final class FormulaClassRepository {
     private final Map<String, ClassNode> sources = new LinkedHashMap<>();
     private final HashSet<String> missing = new HashSet<>();
     private final ClassLoader lookupLoader;
+    private final HashSet<String> sourcePrefixes = new HashSet<>();
+    private final Set<String> sourceFingerprints = new HashSet<>();
+    private boolean baselineCoverage = true;
 
     private FormulaClassRepository(ClassLoader lookupLoader) {
         this.lookupLoader = Objects.requireNonNull(lookupLoader);
@@ -61,6 +76,7 @@ public final class FormulaClassRepository {
     public static FormulaClassRepository fromJars(Collection<Path> paths, ClassLoader lookupLoader) throws IOException {
         var repository = new FormulaClassRepository(lookupLoader);
         for (Path path : paths) {
+            repository.recordSourceFingerprint(path);
             try (var jar = new JarFile(path.toFile())) {
                 var entries = jar.entries();
                 while (entries.hasMoreElements()) {
@@ -77,19 +93,86 @@ public final class FormulaClassRepository {
         return repository;
     }
 
-    public void add(ClassNode owner) {
+    public synchronized void add(ClassNode owner) {
+        executionGraph = null;
+        dataFlows.clear();
+        invocations.clear();
+        sourceSubtypes.clear();
         classes.put(owner.name, owner);
         sources.put(owner.name, owner);
         missing.remove(owner.name);
+    }
+
+    public synchronized void ensureSource(ClassNode owner) {
+        if (sources.get(owner.name) != owner || classes.get(owner.name) != owner) add(owner);
     }
 
     public List<ClassNode> sourceClasses() {
         return List.copyOf(sources.values());
     }
 
+    List<ClassNode> sourceSubtypes(String owner) {
+        return sourceSubtypes.computeIfAbsent(owner, key -> sources.values().stream()
+                .filter(source -> isSubtype(source.name, key)).toList());
+    }
+
+    Set<String> sourceFingerprints() {
+        return Set.copyOf(sourceFingerprints);
+    }
+
+    String recordSourceFingerprint(Path path) throws IOException {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            try (var input = new DigestInputStream(Files.newInputStream(path), digest)) {
+                input.transferTo(java.io.OutputStream.nullOutputStream());
+            }
+            String fingerprint = HexFormat.of().formatHex(digest.digest());
+            sourceFingerprints.add(fingerprint);
+            return fingerprint;
+        } catch (NoSuchAlgorithmException unavailable) { throw new IllegalStateException(unavailable); }
+    }
+
+    public boolean baselineCoverage() {
+        return baselineCoverage;
+    }
+
+    public synchronized void baselineCoverage(boolean enabled) {
+        if (baselineCoverage == enabled) return;
+        baselineCoverage = enabled;
+        executionGraph = null;
+    }
+
+    public synchronized void sealSourcePrefix(String prefix) {
+        sourcePrefixes.add(Objects.requireNonNull(prefix));
+        classes.keySet().removeIf(name -> name.startsWith(prefix) && !sources.containsKey(name));
+        executionGraph = null;
+        dataFlows.clear();
+        invocations.clear();
+        sourceSubtypes.clear();
+    }
+
+    synchronized FormulaExecutionGraph.Index executionGraph() {
+        if (executionGraph == null) executionGraph = FormulaExecutionGraph.createIndex(this);
+        return executionGraph;
+    }
+
+    synchronized FormulaDataFlow.Analysis dataFlow(String owner, MethodNode method) {
+        var id = new FormulaDataFlow.MethodId(owner, method.name, method.desc);
+        String fingerprint = FormulaDataFlow.fingerprint(owner, method);
+        CachedDataFlow cached = dataFlows.get(id);
+        if (cached != null && cached.method() == method && cached.fingerprint().equals(fingerprint)) return cached.analysis();
+        FormulaDataFlow.Analysis analysis = FormulaDataFlow.create(this, owner, method);
+        dataFlows.put(id, new CachedDataFlow(method, fingerprint, analysis));
+        return analysis;
+    }
+
     public ClassNode classNode(String name) {
         ClassNode present = classes.get(name);
         if (present != null || missing.contains(name)) return present;
+        if (sourcePrefixes.stream().anyMatch(name::startsWith)) {
+            missing.add(name);
+            return null;
+        }
         String resource = name + ".class";
         try (InputStream stream = lookupLoader.getResourceAsStream(resource)) {
             if (stream == null) {
@@ -110,21 +193,12 @@ public final class FormulaClassRepository {
     }
 
     public ResolvedMethod resolveMethod(String owner, String name, String descriptor) {
-        var pending = new ArrayDeque<String>();
-        var seen = new HashSet<String>();
-        pending.add(owner);
-        while (!pending.isEmpty()) {
-            String current = pending.removeFirst();
-            if (!seen.add(current)) continue;
-            ClassNode node = classNode(current);
-            if (node == null) continue;
-            for (MethodNode method : node.methods) {
-                if (method.name.equals(name) && method.desc.equals(descriptor)) return new ResolvedMethod(node, method);
-            }
-            if (node.superName != null) pending.addFirst(node.superName);
-            pending.addAll(node.interfaces);
-        }
-        return null;
+        return FormulaMethodResolver.symbolic(this, owner.replace('.', '/'), name, descriptor).target();
+    }
+
+    synchronized FormulaMethodResolver.Resolution resolveInvocation(String caller, MethodInsnNode call, String receiver) {
+        String key = caller + ":" + call.getOpcode() + ':' + call.itf + ':' + call.owner + '#' + call.name + call.desc + ':' + receiver;
+        return invocations.computeIfAbsent(key, ignored -> FormulaMethodResolver.invocation(this, caller, call, receiver));
     }
 
     public ResolvedField resolveField(String owner, String name, String descriptor) {

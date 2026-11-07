@@ -1,7 +1,5 @@
 package com.example.spell_compiler.formula;
 
-import io.redspace.ironsspellbooks.api.config.SpellConfigManager;
-import io.redspace.ironsspellbooks.api.config.SpellConfigParameter;
 import io.redspace.ironsspellbooks.api.registry.AttributeRegistry;
 import io.redspace.ironsspellbooks.api.registry.SpellRegistry;
 import io.redspace.ironsspellbooks.entity.spells.AoeEntity;
@@ -63,8 +61,8 @@ public final class FormulaSiteHooks {
         float spellpower = 1;
         double schoolSpellpower = 1;
         if (caster instanceof LivingEntity entity) {
-            powerMultiplier = SpellConfigManager.getSpellConfigValue(spell, SpellConfigParameter.POWER_MULTIPLIER).floatValue();
-            spellpower = (float) entity.getAttributeValue(AttributeRegistry.SPELL_POWER.get());
+            powerMultiplier = (float) FormulaSpellConfig.number(spell, "power_multiplier");
+            spellpower = (float) entity.getAttributeValue(AttributeRegistry.SPELL_POWER);
             schoolSpellpower = spell.getSchoolType().getPowerFor(entity);
         }
         Number value = FormulaRuntimeDispatcher.invoke(invoker, null,
@@ -76,7 +74,7 @@ public final class FormulaSiteHooks {
         var invoker = FormulaRuntimeDispatcher.resolve(key, caster);
         if (invoker == null) return;
         Number value = FormulaRuntimeDispatcher.invoke(invoker, null, EMPTY);
-        if (value != null) ((AoeEntity) created).setReapplicationDelay(value.intValue());
+        if (value != null) FormulaSpellConfig.aoeInterval(created, value.intValue());
     }
 
     public static Number validateValue(String helperKey, Number value, Object[] arguments) {

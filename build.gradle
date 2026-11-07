@@ -1,36 +1,40 @@
 plugins {
-    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
-    id 'org.spongepowered.mixin' version '0.7.+'
-    id 'org.parchmentmc.librarian.forgegradle' version '1.+'
-    id 'idea'
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.148'
 }
 
 version = mod_version
 group = mod_group_id
-base { archivesName = mod_id }
-java.toolchain.languageVersion = JavaLanguageVersion.of(17)
-jarJar.enable()
+base.archivesName = "${mod_id}-${minecraft_version}-neoforge"
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+def formulaGameTests = providers.gradleProperty('formulaGameTests').isPresent()
 
-minecraft {
-    mappings channel: mapping_channel, version: mapping_version
-    copyIdeResources = true
+neoForge {
+    version = neo_version
+    addModdingDependenciesTo sourceSets.test
+    mods {
+        "${mod_id}" {
+            sourceSet sourceSets.main
+            if (formulaGameTests) sourceSet sourceSets.test
+        }
+    }
     runs {
         client {
-            workingDirectory project.file('run')
-            property 'forge.logging.console.level', 'info'
-            mods { "${mod_id}" { source sourceSets.main } }
+            client()
+            gameDirectory = file('run/client')
         }
         server {
-            workingDirectory project.file('run')
-            property 'forge.logging.console.level', 'info'
-            mods { "${mod_id}" { source sourceSets.main } }
+            server()
+            gameDirectory = file('run/server')
+            programArgument '--nogui'
         }
         gameTestServer {
-            workingDirectory project.file('build/gametest-run')
-            property 'forge.enabledGameTestNamespaces', 'spell_compiler_formula'
-            property 'forge.logging.console.level', 'info'
-            property 'spell_compiler.formulaProbe', 'true'
-            mods { "${mod_id}" { source sourceSets.main; source sourceSets.test } }
+            type = 'gameTestServer'
+            gameDirectory = file('build/gametest-run')
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'spell_compiler_formula,spell_compiler_commit_failure,spell_compiler_component_controls'
+            systemProperty 'spell_compiler.formulaProbe', 'true'
+            sourceSet = sourceSets.test
+            providers.gradlePropertiesPrefixedBy('spell_compiler.').get().each { key, value -> systemProperty key, value }
         }
     }
 }
@@ -40,30 +44,42 @@ sourceSets.main.resources {
     srcDir 'build/generated/formula-resources'
 }
 sourceSets.main.java { srcDir 'build/generated/formula-mixins' }
+sourceSets.test.java {
+    include '**/*Test.java'
+    include '**/NeoForgePortGameTests.java'
+    include '**/NeoForgeEffectsGameTests.java'
+    include '**/NeoForgeGraphGameTests.java'
+    include '**/NeoForgeEffectStreamGameTests.java'
+    include '**/NeoForgeSynchronousGameTests.java'
+    include '**/NeoForgeCommitRollbackGameTests.java'
+    include '**/RealSpellFormulaHarness.java'
+    include '**/FormulaJarProbe.java'
+    include '**/DelegateFactoryParent.java'
+    exclude '**/FormulaLiveExportTest.java'
+}
 sourceSets.test.resources { srcDir 'build/gametest-resources' }
 
-def formulaSourceJar = layout.projectDirectory.file("libs/ironsspells-${ironsspells_version}.jar")
+def formulaSourceJar = layout.projectDirectory.file("libs/irons_spellbooks-${minecraft_version}-${ironsspells_version}.jar")
 def formulaTargets = layout.buildDirectory.file('generated/formula-targets.json')
 def formulaCatalogTargets = layout.buildDirectory.file('generated/formula-catalog-targets.json')
 def formulaMixinSource = layout.buildDirectory.file('generated/formula-mixins/com/example/spell_compiler/mixin/formula/GeneratedSpellFormulaMixin.java')
-def formulaCatalog = layout.buildDirectory.file('generated/formula-resources/formula/ironsspells-3.16.1-catalog.json')
-def formulaExtraTargets = ['ThunderstormEffect', 'FrostbiteEffect', 'GluttonyEffect', 'OakskinEffect', 'SpiderAspectEffect']
-        .collect { "io.redspace.ironsspellbooks.effect.${it}".toString() }
+def formulaCatalog = layout.buildDirectory.file('generated/formula-resources/formula/ironsspells-catalog.json')
 
 tasks.register('generateFormulaMixin') {
     inputs.file(formulaSourceJar)
-    inputs.property('formulaSiteTargets', formulaExtraTargets)
     outputs.files(formulaTargets, formulaMixinSource)
     doLast {
         def targets
         new java.util.jar.JarFile(formulaSourceJar.asFile).withCloseable { jar ->
             targets = jar.stream().filter { entry ->
-                entry.name.startsWith('io/redspace/ironsspellbooks/spells/') &&
-                        entry.name.substring('io/redspace/ironsspellbooks/spells/'.length()).contains('/') &&
-                        entry.name.endsWith('.class') && !entry.name.contains('$')
+                entry.name.endsWith('.class') && !entry.name.contains('$') &&
+                        (entry.name.startsWith('io/redspace/ironsspellbooks/spells/') &&
+                                entry.name.substring('io/redspace/ironsspellbooks/spells/'.length()).contains('/') ||
+                                entry.name.startsWith('io/redspace/ironsspellbooks/entity/spells/') ||
+                                entry.name.startsWith('io/redspace/ironsspellbooks/entity/mobs/') ||
+                                entry.name.startsWith('io/redspace/ironsspellbooks/effect/'))
             }.map { entry -> entry.name.substring(0, entry.name.length() - 6).replace('/', '.') }.sorted().toList()
         }
-        targets = (targets + formulaExtraTargets).unique().sort()
         def indexFile = formulaTargets.get().asFile
         indexFile.parentFile.mkdirs()
         indexFile.setText(groovy.json.JsonOutput.toJson(targets), 'UTF-8')
@@ -77,119 +93,139 @@ tasks.register('generateFormulaMixin') {
     }
 }
 
-tasks.named('compileJava').configure { dependsOn('generateFormulaMixin') }
+tasks.named('compileJava').configure { dependsOn 'generateFormulaMixin' }
 tasks.register('generateFormulaCatalog', JavaExec) {
-    dependsOn('compileJava')
+    dependsOn 'compileJava'
     inputs.file(formulaSourceJar)
     inputs.files(sourceSets.main.output.classesDirs)
+    inputs.file('src/main/resources/formula/binding-identities.json')
     outputs.files(formulaCatalog, formulaCatalogTargets)
-    classpath = sourceSets.main.output.classesDirs + configurations.runtimeClasspath
+    classpath = sourceSets.main.output.classesDirs + configurations.runtimeClasspath + files('src/main/resources')
     mainClass = 'com.example.spell_compiler.formula.FormulaCatalogGenerator'
     doFirst {
         args = [formulaSourceJar.asFile.absolutePath, formulaCatalog.get().asFile.absolutePath, formulaCatalogTargets.get().asFile.absolutePath]
     }
 }
-tasks.named('processResources').configure { dependsOn('generateFormulaCatalog') }
+
+tasks.named('processResources').configure { dependsOn 'generateFormulaCatalog' }
 
 repositories {
-    mavenCentral {
-        content {
-            excludeGroup 'net.minecraft'
-            excludeGroup 'net.minecraftforge'
-            excludeGroup 'de.oceanlabs.mcp'
-            excludeGroupByRegex 'org\\.parchmentmc(\\..*)?'
-        }
-    }
-    flatDir { dir 'libs'; content { includeGroup 'libs' } }
-    maven { url = 'https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/'; content { includeGroup 'software.bernie.geckolib' } }
+    mavenCentral()
     maven { url = 'https://maven.kosmx.dev/'; content { includeGroup 'dev.kosmx.player-anim' } }
+    maven { url = 'https://maven.theillusivec4.top/'; content { includeGroup 'top.theillusivec4.curios' } }
+    maven { url = 'https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/'; content { includeGroup 'software.bernie.geckolib' } }
     maven { url = 'https://code.redspace.io/releases'; content { includeGroup 'io.redspace' } }
 }
 
 dependencies {
-    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
-    annotationProcessor "org.spongepowered:mixin:${mixin_version}:processor"
-    compileOnly(annotationProcessor("io.github.llamalad7:mixinextras-common:${mixinextras_version}"))
-    compileOnly 'org.ow2.asm:asm-analysis:9.5'
-    implementation(jarJar("io.github.llamalad7:mixinextras-forge:${mixinextras_version}")) {
-        jarJar.ranged(it, "[${mixinextras_version},)")
-    }
-    implementation fg.deobf("libs:curios:${libs_version}")
-    implementation fg.deobf("libs:ironsspells:${ironsspells_version}")
-    runtimeOnly fg.deobf("software.bernie.geckolib:geckolib-forge-${geckolib_version}")
-    runtimeOnly fg.deobf("dev.kosmx.player-anim:player-animation-lib-forge:${player_animator_version}")
-    runtimeOnly fg.deobf("io.redspace:irons_lib:${irons_lib_version}")
-    testImplementation platform("org.junit:junit-bom:${junit_version}")
-    testImplementation 'org.junit.jupiter:junit-jupiter'
-    testImplementation fg.deobf("software.bernie.geckolib:geckolib-forge-${geckolib_version}")
-}
-
-mixin {
-    add sourceSets.main, 'spell_compiler.refmap.json'
-    config 'spell_compiler.mixins.json'
-    config 'spell_compiler.formulas.mixins.json'
+    implementation files(formulaSourceJar)
+    implementation fileTree(dir: 'libs', include: '*.jar', exclude: formulaSourceJar.asFile.name)
+    compileOnly 'org.ow2.asm:asm-analysis:9.8'
+    testImplementation "org.junit.jupiter:junit-jupiter:${junit_version}"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 def replaceProperties = [
-    minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
-    forge_version: forge_version, forge_version_range: forge_version_range,
+    minecraft_version_range: minecraft_version_range,
+    neo_version_range: neo_version_range,
     loader_version_range: loader_version_range,
     mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
     mod_authors: mod_authors, mod_description: mod_description,
     ironsspells_version_range: ironsspells_version_range
 ]
+
 processResources {
     filteringCharset = 'UTF-8'
     inputs.properties replaceProperties
-    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) { expand replaceProperties }
+    filesMatching('META-INF/neoforge.mods.toml') { expand replaceProperties }
 }
 
-jar {
+tasks.named('jar', Jar).configure {
+    from('LICENSE')
     manifest {
         attributes([
             'Specification-Title': mod_name,
             'Specification-Vendor': mod_authors,
             'Specification-Version': '1',
             'Implementation-Title': project.name,
-            'Implementation-Version': project.jar.archiveVersion,
-            'Implementation-Vendor': mod_authors,
-            'MixinConfigs': 'spell_compiler.formulas.mixins.json,spell_compiler.mixins.json'
+            'Implementation-Version': mod_version,
+            'Implementation-Vendor': mod_authors
         ])
     }
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
 }
-jar.finalizedBy('reobfJar')
-reobf { jarJar {} }
-tasks.named('jar').configure { archiveClassifier.set('slim') }
-tasks.named('jarJar').configure { archiveClassifier.set(''); finalizedBy('reobfJarJar') }
-tasks.named('build').configure { dependsOn('jarJar') }
-tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
-tasks.named('test', Test).configure { useJUnitPlatform() }
 
-tasks.register('prepareGameTestTemplate') {
-    def targets = ['spell_compiler', 'spell_compiler_formula', 'spell_compiler_formula_remote'].collect {
-        layout.buildDirectory.file("gametest-resources/data/${it}/structures/empty.nbt")
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.named('test', Test).configure {
+    maxHeapSize = '2g'
+    useJUnitPlatform { excludeTags 'legacy-forge-fixture' }
+    systemProperty 'spell_compiler.legacyIronJar', providers.gradleProperty('legacyIronJar')
+            .getOrElse(file('libs/fixtures/irons_spellbooks-1.21-3.8.10.jar').absolutePath)
+    doFirst {
+        def fixture = file(systemProperties['spell_compiler.legacyIronJar'])
+        if (!fixture.isFile()) throw new GradleException('Missing Iron 3.8.10 test fixture. Put it in libs/fixtures or set -PlegacyIronJar=<absolute JAR path>. See dependencies.json.')
     }
-    outputs.files(targets)
+}
+
+tasks.register('verifyLocalDependencies') {
     doLast {
-        targets.each { output ->
-            def target = output.get().asFile
-            target.parentFile.mkdirs()
-            new DataOutputStream(new java.util.zip.GZIPOutputStream(new FileOutputStream(target))).withCloseable { data ->
-                data.writeByte(10); data.writeUTF('')
-                data.writeByte(3); data.writeUTF('DataVersion'); data.writeInt(3465)
-                data.writeByte(9); data.writeUTF('size'); data.writeByte(3); data.writeInt(3)
-                3.times { data.writeInt(3) }
-                data.writeByte(9); data.writeUTF('palette'); data.writeByte(10); data.writeInt(1)
-                data.writeByte(8); data.writeUTF('Name'); data.writeUTF('minecraft:air'); data.writeByte(0)
-                ['blocks', 'entities'].each { name ->
-                    data.writeByte(9); data.writeUTF(name); data.writeByte(10); data.writeInt(0)
-                }
-                data.writeByte(0)
+        def required = [formulaSourceJar.asFile.name, 'curios-neoforge-9.5.1+1.21.1.jar',
+                'geckolib-neoforge-1.21.1-4.7.5.1.jar', 'irons_lib-1.21.1-2.1.0.jar',
+                'player-animation-lib-forge-2.0.1+1.21.1.jar']
+        def missing = required.findAll { !file("libs/${it}").isFile() }
+        if (!missing.isEmpty()) throw new GradleException("Missing local dependencies in libs: ${missing}. See dependencies.json for sources and checksums.")
+        def manifest = new groovy.json.JsonSlurper().parse(file('dependencies.json'))
+        manifest.requiredRuntimeFiles.each { entry ->
+            def source = file("libs/${entry.file}")
+            if (source.isFile()) {
+                def actual = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance('SHA-256').digest(source.bytes))
+                if (actual != entry.sha256) throw new GradleException("Local dependency checksum mismatch: ${entry.file}")
             }
         }
     }
 }
-tasks.named('processTestResources').configure { dependsOn('prepareGameTestTemplate') }
-if (providers.gradleProperty('formulaProbeDir').isPresent()) {
-    minecraft.runs.gameTestServer { workingDirectory file(providers.gradleProperty('formulaProbeDir').get()) }
+tasks.named('compileJava').configure { dependsOn 'verifyLocalDependencies' }
+
+tasks.register('prepareGameTestTemplate') {
+    def output = layout.buildDirectory.file('gametest-resources/data/spell_compiler_formula/structure/empty.nbt')
+    outputs.file(output)
+    doLast {
+        def target = output.get().asFile
+        target.parentFile.mkdirs()
+        new DataOutputStream(new java.util.zip.GZIPOutputStream(new FileOutputStream(target))).withCloseable { data ->
+            data.writeByte(10); data.writeUTF('')
+            data.writeByte(3); data.writeUTF('DataVersion'); data.writeInt(3955)
+            data.writeByte(9); data.writeUTF('size'); data.writeByte(3); data.writeInt(3)
+            3.times { data.writeInt(5) }
+            data.writeByte(9); data.writeUTF('palette'); data.writeByte(10); data.writeInt(1)
+            data.writeByte(8); data.writeUTF('Name'); data.writeUTF('minecraft:air'); data.writeByte(0)
+            ['blocks', 'entities'].each { name ->
+                data.writeByte(9); data.writeUTF(name); data.writeByte(10); data.writeInt(0)
+            }
+            data.writeByte(0)
+        }
+    }
+}
+
+tasks.named('processTestResources').configure { dependsOn 'prepareGameTestTemplate' }
+tasks.named('prepareGameTestTemplate').configure {
+    outputs.files(
+            layout.buildDirectory.file('gametest-resources/data/spell_compiler_runtime_remote/structure/empty.nbt'),
+            layout.buildDirectory.file('gametest-resources/data/spell_compiler_commit_failure/structure/empty.nbt'),
+            layout.buildDirectory.file('gametest-resources/data/spell_compiler_component_controls/structure/empty.nbt'))
+    doLast {
+        copy {
+            from layout.buildDirectory.file('gametest-resources/data/spell_compiler_formula/structure/empty.nbt')
+            into layout.buildDirectory.dir('gametest-resources/data/spell_compiler_runtime_remote/structure')
+        }
+        copy {
+            from layout.buildDirectory.file('gametest-resources/data/spell_compiler_formula/structure/empty.nbt')
+            into layout.buildDirectory.dir('gametest-resources/data/spell_compiler_commit_failure/structure')
+        }
+        copy {
+            from layout.buildDirectory.file('gametest-resources/data/spell_compiler_formula/structure/empty.nbt')
+            into layout.buildDirectory.dir('gametest-resources/data/spell_compiler_component_controls/structure')
+        }
+    }
 }

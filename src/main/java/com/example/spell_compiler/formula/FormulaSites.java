@@ -32,15 +32,17 @@ public final class FormulaSites {
 
     private record Selected(MethodNode method, Rule rule, List<AbstractInsnNode> points) {}
 
+    record BindingPoint(String alias, String owner, String method, String descriptor, int instruction,
+                        boolean replacesReturn) {}
+
     private static final String SPELLS = "io.redspace.ironsspellbooks.spells.";
     private static final String EFFECT = "io.redspace.ironsspellbooks.effect.ThunderstormEffect";
     private static final String HOOKS = "com/example/spell_compiler/formula/FormulaSiteHooks";
     private static final String HEALING_AOE = "io/redspace/ironsspellbooks/entity/spells/HealingAoe";
     private static final String AOE = "io/redspace/ironsspellbooks/entity/spells/AoeEntity";
     private static final String ON_CAST = "(Lnet/minecraft/world/level/Level;ILnet/minecraft/world/entity/LivingEntity;Lio/redspace/ironsspellbooks/api/spells/CastSource;Lio/redspace/ironsspellbooks/api/magic/MagicData;)V";
-    private static final String PRE_CAST = "(Lnet/minecraft/world/level/Level;ILnet/minecraft/world/entity/LivingEntity;Lio/redspace/ironsspellbooks/api/magic/MagicData;)Z";
     private static final String UNIQUE_INFO = "(ILnet/minecraft/world/entity/LivingEntity;)Ljava/util/List;";
-    private static final String EFFECT_TICK = "(Lnet/minecraft/world/entity/LivingEntity;I)V";
+    private static final String EFFECT_TICK = "(Lnet/minecraft/world/entity/LivingEntity;I)Z";
     private static final Definition HEALING = definition("holy.HealingCircleSpell", "healing_interval_ticks", "healingInterval", "()I", 1, Integer.MAX_VALUE);
     private static final Definition SUMMON = definition("ice.SummonPolarBearSpell", "summon_duration_ticks", "summonDuration", "(Ljava/lang/Object;)I", 0, Integer.MAX_VALUE);
     private static final Definition FIRE = definition("fire.FireboltSpell", "fire_duration_ticks", "fireTicks", "()I", 0, Integer.MAX_VALUE);
@@ -49,27 +51,43 @@ public final class FormulaSites {
     private static final Definition INTERVAL = definition("lightning.ThunderstormSpell", "strike_interval_ticks", "strikeInterval", "()I", 1, Integer.MAX_VALUE);
     private static final Definition HORIZONTAL = definition("lightning.ThunderstormSpell", "horizontal_range", "horizontalRange", "()I", 0, 46340);
     private static final Definition VERTICAL = definition("lightning.ThunderstormSpell", "vertical_range", "verticalRange", "()D", 0, Double.MAX_VALUE);
-    private static final Definition HASTE = definition("holy.HasteSpell", "radius", "hasteRadius", "()F", 0, Math.sqrt(Float.MAX_VALUE));
     private static final Definition BONUS = definition("blood.SacrificeSpell", "summon_health_bonus", "sacrificeHealthBonus", "(F)F", 0, Float.MAX_VALUE);
-    private static final List<Definition> DEFINITIONS = List.of(HEALING, SUMMON, FIRE, STORM, INTERVAL, HORIZONTAL, VERTICAL, HASTE, BONUS);
+    private static final List<Definition> DEFINITIONS = List.of(HEALING, SUMMON, FIRE, STORM, INTERVAL, HORIZONTAL, VERTICAL, BONUS);
     private static final List<Rule> RULES = List.of(
             rule(HEALING, "onCast", ON_CAST, Kind.CREATED_AOE, null, 1, 3),
             rule(SUMMON, "onCast", ON_CAST, Kind.SUMMON_DURATION, 12000, 1, 3),
             rule(FIRE, "getDamageSource", "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/entity/Entity;)Lio/redspace/ironsspellbooks/damage/SpellDamageSource;", Kind.INT, 60, 1, 2),
             new Rule(EFFECT, Set.of("getDamageFromAmplifier"), "(ILnet/minecraft/world/entity/LivingEntity;)F", Kind.STORM_DAMAGE, STORM, null, 1, 1),
-            new Rule(EFFECT, Set.of("isDurationEffectTick", "m_6584_"), "(II)Z", Kind.INT, INTERVAL, 40, 1, -1),
+            new Rule(EFFECT, Set.of("shouldApplyEffectTickThisTick"), "(II)Z", Kind.INT, INTERVAL, 40, 1, -1),
             new Rule(EFFECT, Set.of("applyEffectTick", "m_6742_"), EFFECT_TICK, Kind.INT_AS_DOUBLE, HORIZONTAL, 20d, 2, 1),
             new Rule(EFFECT, Set.of("applyEffectTick", "m_6742_"), EFFECT_TICK, Kind.SQUARED_INT, HORIZONTAL, 400, 1, 1),
             new Rule(EFFECT, Set.of("applyEffectTick", "m_6742_"), EFFECT_TICK, Kind.DOUBLE, VERTICAL, 12d, 1, 1),
             rule(HORIZONTAL, "getUniqueInfo", UNIQUE_INFO, Kind.INT, 20, 1, 2),
-            rule(HASTE, "checkPreCastConditions", PRE_CAST, Kind.FLOAT, 3f, 1, 3),
-            rule(HASTE, "onCast", ON_CAST, Kind.FLOAT, 3f, 1, 3),
             rule(BONUS, "onCast", ON_CAST, Kind.SUMMON_BONUS, null, 1, 3));
 
     private FormulaSites() {}
 
     public static List<Definition> definitions(String spellClassName) {
         return DEFINITIONS.stream().filter(value -> value.spellClassName().equals(spellClassName)).toList();
+    }
+
+    static List<BindingPoint> bindingPoints(FormulaClassRepository repository, String spellClassName) {
+        if (!repository.baselineCoverage()) return List.of();
+        List<BindingPoint> result = new ArrayList<>();
+        for (String owner : targetClasses().stream().sorted().toList()) {
+            if (RULES.stream().noneMatch(rule -> rule.owner().equals(owner)
+                    && rule.definition().spellClassName().equals(spellClassName.replace('/', '.')))) continue;
+            ClassNode source = repository.classNode(owner.replace('.', '/'));
+            if (source == null) continue;
+            for (Selected selected : select(owner, source)) {
+                if (!selected.rule().definition().spellClassName().equals(spellClassName.replace('/', '.'))) continue;
+                List<AbstractInsnNode> executable = executable(selected.method());
+                for (AbstractInsnNode point : selected.points()) result.add(new BindingPoint(selected.rule().definition().alias(),
+                        owner.replace('.', '/'), selected.method().name, selected.method().desc, executable.indexOf(point),
+                        point.getOpcode() >= Opcodes.IRETURN && point.getOpcode() <= Opcodes.DRETURN));
+            }
+        }
+        return List.copyOf(result);
     }
 
     public static Set<String> targetClasses() {
@@ -179,8 +197,6 @@ public final class FormulaSites {
         if (rule.definition() == INTERVAL) return opcode(next(node)) == Opcodes.IREM;
         if (rule.definition() == SUMMON || rule.kind() == Kind.SQUARED_INT)
             return next(node) instanceof VarInsnNode store && store.getOpcode() == Opcodes.ISTORE;
-        if (rule.definition() == HASTE)
-            return next(node) instanceof VarInsnNode store && store.getOpcode() == Opcodes.FSTORE;
         if (rule.methods().contains("getUniqueInfo"))
             return next(node) instanceof MethodInsnNode call && call.owner.equals("java/lang/Integer")
                     && call.name.equals("valueOf") && call.desc.equals("(I)Ljava/lang/Integer;");

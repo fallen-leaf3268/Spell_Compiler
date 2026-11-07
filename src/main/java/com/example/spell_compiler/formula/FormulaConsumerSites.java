@@ -17,8 +17,11 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 public final class FormulaConsumerSites {
-    public record Definition(String spellClassName, String effectId, String alias, String method) {
-        public String key() { return method + VALUE_ARGUMENTS + 'F'; }
+    public record Definition(String spellClassName, String effectId, String alias, String method, String descriptor) {
+        public Definition(String spellClassName, String effectId, String alias, String method) {
+            this(spellClassName, effectId, alias, method, VALUE_ARGUMENTS + 'F');
+        }
+        public String key() { return method + descriptor; }
         public String dispatchKey() { return spellClassName + '#' + key(); }
     }
 
@@ -32,6 +35,7 @@ public final class FormulaConsumerSites {
     private static final String HOOKS = "com/example/spell_compiler/formula/FormulaConsumerHooks";
     private static final String VALUE_ARGUMENTS = "(ILnet/minecraft/world/entity/LivingEntity;)";
     private static final String ON_CAST = "(Lnet/minecraft/world/level/Level;ILnet/minecraft/world/entity/LivingEntity;Lio/redspace/ironsspellbooks/api/spells/CastSource;Lio/redspace/ironsspellbooks/api/magic/MagicData;)V";
+    private static final Set<String> ATTRIBUTE_ALIASES = Set.of("percent_attack_damage", "percent_speed", "percent_spell_power");
     private static final List<Definition> DEFINITIONS = List.of(
             definition("ice.FrostbiteSpell", "frostbite", "damage", "getDamage"),
             definition("lightning.ChargeSpell", "charged", "percent_attack_damage", "getPercentAttackDamage"),
@@ -45,19 +49,100 @@ public final class FormulaConsumerSites {
             SPELLS + "holy.SunbeamSpell", Set.of("getDuration" + VALUE_ARGUMENTS + 'I'),
             SPELLS + "evocation.GustSpell", Set.of("getDamage" + VALUE_ARGUMENTS + 'F'));
     private static final List<Rule> RULES = rules();
+    private static final Map<String, List<Definition>> FIXED_BY_SPELL = DEFINITIONS.stream().collect(Collectors.groupingBy(Definition::spellClassName,
+            Collectors.collectingAndThen(Collectors.toList(), List::copyOf)));
+    private static final Map<String, List<Definition>> ATTRIBUTES_BY_SPELL = DEFINITIONS.stream().filter(value -> ATTRIBUTE_ALIASES.contains(value.alias()))
+            .collect(Collectors.groupingBy(Definition::spellClassName, Collectors.collectingAndThen(Collectors.toList(), List::copyOf)));
+    private static final Map<String, Set<String>> ATTRIBUTE_ALIASES_BY_EFFECT = DEFINITIONS.stream().filter(value -> ATTRIBUTE_ALIASES.contains(value.alias()))
+            .collect(Collectors.toUnmodifiableMap(Definition::effectId, value -> Set.of(value.alias()), (left, right) -> {
+                var merged = new java.util.HashSet<>(left);
+                merged.addAll(right);
+                return Set.copyOf(merged);
+            }));
 
     private FormulaConsumerSites() {}
+
+    private record EffectIndex(List<Definition> dynamic,
+                               Map<String, List<FormulaEffectAttributeControls.Definition>> attributes,
+                               Map<String, List<Definition>> definitions, Map<String, Set<String>> aliases,
+                               Map<String, List<Definition>> bySpell, Map<Definition, Invocation> invocations) {}
+    record Invocation(String dispatchKey, boolean singleArgument, boolean attribute) {}
+    private static volatile EffectIndex effectIndex;
+
+    private static EffectIndex effectIndex() {
+        var dynamic = FormulaManaRatioBridge.allDefinitions();
+        var attributes = FormulaEffectAttributeControls.effectIndex();
+        var current = effectIndex;
+        if (current != null && current.dynamic() == dynamic && current.attributes() == attributes) return current;
+        return rebuildEffectIndex(dynamic, attributes);
+    }
+
+    private static synchronized EffectIndex rebuildEffectIndex(List<Definition> dynamic,
+            Map<String, List<FormulaEffectAttributeControls.Definition>> attributes) {
+        var current = effectIndex;
+        if (current != null && current.dynamic() == dynamic && current.attributes() == attributes) return current;
+        Map<String, List<Definition>> definitions = new java.util.HashMap<>();
+        Map<String, Set<String>> aliases = new java.util.HashMap<>();
+        Map<String, List<Definition>> bySpell = new java.util.HashMap<>();
+        Map<Definition, Invocation> invocations = new java.util.HashMap<>();
+        for (var entries : List.of(DEFINITIONS, dynamic)) for (var definition : entries) {
+            var selected = definitions.computeIfAbsent(definition.effectId(), ignored -> new ArrayList<>());
+            if (!selected.contains(definition)) selected.add(definition);
+            aliases.computeIfAbsent(definition.effectId(), ignored -> new java.util.HashSet<>()).add(definition.alias());
+            var spellDefinitions = bySpell.computeIfAbsent(definition.spellClassName().replace('/', '.'), ignored -> new ArrayList<>());
+            if (!spellDefinitions.contains(definition)) spellDefinitions.add(definition);
+            invocations.computeIfAbsent(definition, FormulaConsumerSites::invocation);
+        }
+        attributes.forEach((id, entries) -> {
+            var selected = aliases.computeIfAbsent(id, ignored -> new java.util.HashSet<>());
+            for (var definition : entries) selected.add(definition.numeric().alias());
+        });
+        definitions.replaceAll((id, entries) -> List.copyOf(entries));
+        aliases.replaceAll((id, entries) -> Set.copyOf(entries));
+        bySpell.replaceAll((id, entries) -> List.copyOf(entries));
+        current = new EffectIndex(dynamic, attributes, Map.copyOf(definitions), Map.copyOf(aliases), Map.copyOf(bySpell), Map.copyOf(invocations));
+        effectIndex = current;
+        return current;
+    }
 
     public static boolean excludedGetter(String className, String methodKey) {
         return EXCLUDED.getOrDefault(className.replace('/', '.'), Set.of()).contains(methodKey);
     }
 
     public static List<Definition> definitions(String spellClassName) {
-        return DEFINITIONS.stream().filter(value -> value.spellClassName().equals(spellClassName)).toList();
+        return effectIndex().bySpell().getOrDefault(spellClassName.replace('/', '.'), List.of());
+    }
+
+    static Map<Definition, Invocation> invocations() { return effectIndex().invocations(); }
+
+    static Invocation invocation(Definition value) {
+        return new Invocation(value.dispatchKey(), org.objectweb.asm.Type.getArgumentTypes(value.descriptor()).length == 1,
+                attributeDefinitions(value.spellClassName()).contains(value));
+    }
+
+    static Set<String> attributeControlAliases(String effectId) {
+        return ATTRIBUTE_ALIASES_BY_EFFECT.getOrDefault(effectId, Set.of());
+    }
+
+    static List<Definition> fixedDefinitions(String spellClassName) {
+        return FIXED_BY_SPELL.getOrDefault(spellClassName.replace('/', '.'), List.of());
     }
 
     public static List<Definition> forEffect(String effectId) {
-        return DEFINITIONS.stream().filter(value -> value.effectId().equals(effectId)).toList();
+        return effectIndex().definitions().getOrDefault(effectId, List.of());
+    }
+
+    public static Set<String> aliasesForEffect(String effectId) {
+        return effectIndex().aliases().getOrDefault(effectId, Set.of());
+    }
+
+    public static List<Definition> attributeDefinitions(String spellClassName) {
+        return ATTRIBUTES_BY_SPELL.getOrDefault(spellClassName.replace('/', '.'), List.of());
+    }
+
+    static boolean hasAttributeControls(FormulaClassRepository repository, String spellClassName) {
+        return attributeDefinitions(spellClassName).stream().anyMatch(definition ->
+                repository.resolveMethod(definition.spellClassName().replace('.', '/'), definition.method(), VALUE_ARGUMENTS + 'F') != null);
     }
 
     public static Set<String> targetClasses() {
@@ -105,15 +190,15 @@ public final class FormulaConsumerSites {
                 var products = executable(method).stream().filter(instruction -> instruction.getOpcode() == Opcodes.FMUL
                         && next(instruction) instanceof MethodInsnNode call && call.desc.equals("(F)V")
                         && call.owner.equals(rule.alias().equals("mana_ratio")
-                        ? "io/redspace/ironsspellbooks/api/magic/MagicData" : "net/minecraftforge/event/entity/living/"
-                        + (rule.kind() == Kind.SPIDER_PRODUCT ? "LivingDamageEvent" : "LivingHurtEvent"))
+                        ? "io/redspace/ironsspellbooks/api/magic/MagicData"
+                        : "net/neoforged/neoforge/event/entity/living/LivingIncomingDamageEvent")
                         && call.name.equals(rule.alias().equals("mana_ratio") ? "addMana" : "setAmount")).toList();
                 var inputs = executable(method).stream().filter(instruction -> instruction instanceof MethodInsnNode call
                         && (rule.alias().equals("mana_ratio") ? call.owner.equals("net/minecraft/world/food/FoodProperties")
-                        && Set.of("getNutrition", "m_38744_").contains(call.name) && call.desc.equals("()I")
-                        : call.owner.equals("net/minecraftforge/event/entity/living/"
-                        + (rule.kind() == Kind.SPIDER_PRODUCT ? "LivingDamageEvent" : "LivingHurtEvent"))
-                        && call.name.equals("getAmount") && call.desc.equals("()F"))).toList();
+                        && Set.of("nutrition").contains(call.name) && call.desc.equals("()I")
+                        : call.owner.equals("net/neoforged/neoforge/event/entity/living/LivingIncomingDamageEvent")
+                        && call.name.equals("getAmount") && call.desc.equals("()F")
+                        && next(call) instanceof VarInsnNode load && load.getOpcode() == Opcodes.FLOAD)).toList();
                 if (products.size() != 1 || inputs.size() != 1)
                     throw mismatch(rule, "product count=" + products.size() + " input count=" + inputs.size());
                 point = products.get(0);
@@ -130,11 +215,11 @@ public final class FormulaConsumerSites {
     private static boolean matches(Rule rule, AbstractInsnNode instruction) {
         if (rule.kind() == Kind.CAPTURE) return instruction instanceof MethodInsnNode call
                 && call.getOpcode() == Opcodes.INVOKESPECIAL && call.owner.equals("net/minecraft/world/effect/MobEffectInstance")
-                && call.name.equals("<init>") && call.desc.equals("(Lnet/minecraft/world/effect/MobEffect;IIZZZ)V");
+                && call.name.equals("<init>") && call.desc.equals("(Lnet/minecraft/core/Holder;IIZZZ)V");
         if (rule.kind() == Kind.CALL || rule.kind() == Kind.PRODUCT) return instruction instanceof MethodInsnNode call
                 && call.getOpcode() == Opcodes.INVOKESTATIC && call.owner.equals(rule.calledOwner().replace('.', '/'))
                 && call.name.equals(rule.calledMethod()) && call.desc.equals(rule.alias().equals("damage")
-                ? "(ILnet/minecraft/world/entity/LivingEntity;)F" : "(I)F");
+                || rule.alias().equals("percent_damage") ? "(ILnet/minecraft/world/entity/LivingEntity;)F" : "(I)F");
         var converted = previous(instruction);
         var level = previous(converted);
         var factor = previous(level);
@@ -188,19 +273,19 @@ public final class FormulaConsumerSites {
         for (var owner : DEFINITIONS.stream().map(Definition::spellClassName).distinct().toList())
             result.add(new Rule(owner, "onCast", ON_CAST, Kind.CAPTURE, null, null, null, -1, 1));
         result.add(new Rule(EFFECTS + "FrostbiteEffect", "handleFrostbiteDeathEffects",
-                "(Lnet/minecraftforge/event/entity/living/LivingDeathEvent;)V", Kind.CALL, "damage",
+                "(Lnet/neoforged/neoforge/event/entity/living/LivingDeathEvent;)V", Kind.CALL, "damage",
                 EFFECTS + "FrostbiteEffect", "getDamageForAmplifier", 4, 1));
         result.add(new Rule(EFFECTS + "GluttonyEffect", "finishEating",
-                "(Lnet/minecraftforge/event/entity/living/LivingEntityUseItemEvent$Finish;)V", Kind.PRODUCT, "mana_ratio",
+                "(Lnet/neoforged/neoforge/event/entity/living/LivingEntityUseItemEvent$Finish;)V", Kind.PRODUCT, "mana_ratio",
                 EFFECTS + "GluttonyEffect", "ratioForAmplifier", 3, 1));
         result.add(new Rule(EFFECTS + "OakskinEffect", "reduceDamage",
-                "(Lnet/minecraftforge/event/entity/living/LivingHurtEvent;)V", Kind.PRODUCT, "percent_damage",
+                "(Lnet/neoforged/neoforge/event/entity/living/LivingIncomingDamageEvent;)V", Kind.PRODUCT, "percent_damage",
                 EFFECTS + "OakskinEffect", "getReductionAmount", 2, 100));
         result.add(new Rule(EFFECTS + "OakskinEffect", "getDescriptionLine",
                 "(Lnet/minecraft/world/effect/MobEffectInstance;)Lnet/minecraft/network/chat/Component;", Kind.CALL, "percent_damage",
                 EFFECTS + "OakskinEffect", "getReductionAmount", 1, 100));
         result.add(new Rule(EFFECTS + "SpiderAspectEffect", "increaseDamage",
-                "(Lnet/minecraftforge/event/entity/living/LivingDamageEvent;)V", Kind.SPIDER_PRODUCT, "percent_damage",
+                "(Lnet/neoforged/neoforge/event/entity/living/LivingIncomingDamageEvent;)V", Kind.SPIDER_PRODUCT, "percent_damage",
                 null, null, 2, 100));
         return List.copyOf(result);
     }

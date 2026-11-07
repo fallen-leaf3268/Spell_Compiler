@@ -1,6 +1,7 @@
 .gradle/
 build/
 libs/*.jar
+libs/fixtures/
 /src/test/
 !gradle/wrapper/gradle-wrapper.jar
 

@@ -1,7 +1,7 @@
 {
   "required": true,
   "minVersion": "0.8.5",
-  "compatibilityLevel": "JAVA_17",
+  "compatibilityLevel": "JAVA_21",
   "package": "com.example.spell_compiler.mixin.formula",
   "plugin": "com.example.spell_compiler.formula.FormulaMixinPlugin",
   "mixins": ["GeneratedSpellFormulaMixin"]

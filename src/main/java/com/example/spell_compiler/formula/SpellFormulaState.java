@@ -13,7 +13,8 @@ public final class SpellFormulaState {
     private SpellFormulaState() {}
 
     public static synchronized SpellFormulaCatalog initialize(ClassLoader loader) throws IOException {
-        if (catalog == null) catalog = SpellFormulaCatalog.load(loader);
+        if (FormulaLoadedCatalog.disabled()) catalog = FormulaLoadedCatalog.unavailable();
+        if (catalog == null) catalog = FormulaLoadedCatalog.prepare(loader, FormulaAddonDiscovery.current());
         return catalog;
     }
 
@@ -43,6 +44,7 @@ public final class SpellFormulaState {
     }
 
     public static synchronized SpellFormulaCatalog catalog() {
+        if (FormulaLoadedCatalog.disabled()) catalog = FormulaLoadedCatalog.unavailable();
         if (catalog == null) throw new IllegalStateException("法术公式目录尚未初始化");
         return catalog;
     }
@@ -50,7 +52,7 @@ public final class SpellFormulaState {
     static synchronized void replaceCatalog(SpellFormulaCatalog value) {
         if (!serverSnapshot.byClass().isEmpty() || !clientSnapshot.byClass().isEmpty())
             throw new IllegalStateException("不能在公式已应用后替换法术目录");
-        catalog = value;
+        catalog = FormulaLoadedCatalog.disabled() ? FormulaLoadedCatalog.unavailable() : value;
     }
 
     public static synchronized String catalogFingerprint() {

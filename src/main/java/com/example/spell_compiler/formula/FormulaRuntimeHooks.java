@@ -1,11 +1,9 @@
 package com.example.spell_compiler.formula;
 
-import io.redspace.ironsspellbooks.api.config.SpellConfigManager;
-import io.redspace.ironsspellbooks.api.config.SpellConfigParameter;
 import io.redspace.ironsspellbooks.api.spells.AbstractSpell;
 import io.redspace.ironsspellbooks.api.spells.CastType;
 import net.minecraft.world.entity.Entity;
-import net.minecraftforge.fml.util.thread.EffectiveSide;
+import net.neoforged.fml.util.thread.EffectiveSide;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -89,6 +87,7 @@ public final class FormulaRuntimeHooks {
     static void clearParameterFailures() {
         PARAMETER_FAILURES.clear();
         FormulaNativeValues.clearFailures();
+        FormulaNumericHooks.clearFailures();
     }
 
     private static SpellFormulaFiles.SpellOverride parameterOverride(Object spell, Object caster) {
@@ -105,7 +104,7 @@ public final class FormulaRuntimeHooks {
         try {
             FormulaParameterLimits.manaCost(parameter(source, override, "baseManaCost"),
                     parameter(source, override, "manaCostPerLevel"), level,
-                    (Double) SpellConfigManager.getSpellConfigValue(source, SpellConfigParameter.MANA_MULTIPLIER));
+                    FormulaSpellConfig.number(source, "mana_cost_multiplier"));
             return original;
         } catch (ArithmeticException failure) {
             reportParameterFailure(override, MANA_COST, failure);

@@ -1,0 +1,50 @@
+{
+  "directory": "libs",
+  "requiredRuntimeFiles": [
+    {
+      "file": "curios-neoforge-9.5.1+1.21.1.jar",
+      "sha256": "a45df2125c26219974aba7507ffc9afe7b83acc941a386af3faacb1cc0056fde",
+      "declaredProjectUrls": [
+        "https://github.com/TheIllusiveC4/Curios/issues",
+        "https://github.com/TheIllusiveC4/Curios"
+      ]
+    },
+    {
+      "file": "geckolib-neoforge-1.21.1-4.7.5.1.jar",
+      "sha256": "18ed56f73327525fa96bf90c5e98c044641d2287447215810a464a77468b5e0a",
+      "declaredProjectUrls": [
+        "https://github.com/bernie-g/geckolib/issues"
+      ]
+    },
+    {
+      "file": "irons_lib-1.21.1-2.1.0.jar",
+      "sha256": "3d0ad1003d6edeaad2500b9922267b4192d2c603cdd846fda339b168f4deff72",
+      "declaredProjectUrls": []
+    },
+    {
+      "file": "irons_spellbooks-1.21.1-3.16.3.jar",
+      "sha256": "55a290db9b966e0c5d2f5c051d50775f3db6375cdb52730c4da528bcf5d5daa0",
+      "declaredProjectUrls": [
+        "https://github.com/iron431/Irons-Spells-n-Spellbooks/issues",
+        "https://www.curseforge.com/minecraft/mc-mods/irons-spells-n-spellbooks"
+      ]
+    },
+    {
+      "file": "player-animation-lib-forge-2.0.1+1.21.1.jar",
+      "sha256": "15ef231ca57ad2a237a3760dd9aa17b34926fc6e8bf07564434969534c70aa3e",
+      "declaredProjectUrls": [
+        "https://github.com/KosmX/minecraftPlayerAnimator"
+      ]
+    }
+  ],
+  "testFixtures": [
+    {
+      "file": "libs/fixtures/irons_spellbooks-1.21-3.8.10.jar",
+      "version": "1.21-3.8.10",
+      "sha256": "f9fe69219307c8d899b9504394b4306c2df3548c2d697469af1fc655911cfa86",
+      "override": "-PlegacyIronJar=<absolute JAR path>",
+      "declaredProjectUrl": "https://www.curseforge.com/minecraft/mc-mods/irons-spells-n-spellbooks"
+    }
+  ],
+  "note": "Acquire the exact listed releases from their declared project pages; binaries remain local and are not included in the source repository."
+}

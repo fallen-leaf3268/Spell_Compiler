@@ -21,6 +21,7 @@ public final class FormulaMethodCompatibility {
     private static final Map<String, Map<Call, Integer>> ORIGINALS = new ConcurrentHashMap<>();
     private static final Map<String, String> CONFLICTS = new ConcurrentHashMap<>();
     private static final Map<String, ClassNode> TRANSFORMED = new ConcurrentHashMap<>();
+    private static final Map<String, FormulaDispatchContract> CONTRACTS = new ConcurrentHashMap<>();
 
     private FormulaMethodCompatibility() {}
 
@@ -29,6 +30,11 @@ public final class FormulaMethodCompatibility {
         ORIGINALS.put(key, calls(method));
         CONFLICTS.remove(key);
         TRANSFORMED.remove(key);
+        CONTRACTS.remove(key);
+    }
+
+    static void requireDispatch(String owner, MethodNode method, boolean dynamic) {
+        CONTRACTS.put(key(owner, method.name + method.desc), new FormulaDispatchContract(owner, method, dynamic));
     }
 
     static void observeTransformed(ClassNode owner, Set<String> methodKeys) {
@@ -50,16 +56,26 @@ public final class FormulaMethodCompatibility {
                     .map(entry -> entry.getKey().signature() + "（原有 " + entry.getValue()
                             + " 次，现有 " + actual.getOrDefault(entry.getKey(), 0) + " 次）")
                     .collect(Collectors.joining("；"));
+            var contract = CONTRACTS.get(key);
+            if (contract != null) {
+                String failure = contract.failure(method);
+                if (failure != null) missing = missing.isEmpty() ? failure : missing + "；" + failure;
+            }
         }
         if (missing.isEmpty()) {
             CONFLICTS.remove(key);
         } else {
-            CONFLICTS.put(key, "检测到数值调用点被替换或移除，公式覆盖可能绕过第三方修改；已拒绝该公式覆盖，保留原生方法："
-                    + key + "；缺失调用：" + missing);
+            CONFLICTS.put(key, "检测到数值调用点或分派控制流变化，公式覆盖可能绕过第三方修改；已拒绝该公式覆盖，保留原生方法："
+                    + key + "；不兼容原因：" + missing);
         }
     }
 
     public static void requireCompatible(String owner, String methodKey) {
+        String conflict = unavailableReason(owner, methodKey);
+        if (conflict != null) throw new IllegalArgumentException(conflict);
+    }
+
+    public static String unavailableReason(String owner, String methodKey) {
         String key = key(owner, methodKey);
         ClassNode transformed = TRANSFORMED.get(key);
         if (transformed != null) {
@@ -67,8 +83,7 @@ public final class FormulaMethodCompatibility {
                     .filter(value -> (value.name + value.desc).equals(methodKey)).findFirst().orElse(null);
             inspect(owner, methodKey, method);
         }
-        String conflict = CONFLICTS.get(key);
-        if (conflict != null) throw new IllegalArgumentException(conflict);
+        return CONFLICTS.get(key);
     }
 
     private static Map<Call, Integer> calls(MethodNode method) {

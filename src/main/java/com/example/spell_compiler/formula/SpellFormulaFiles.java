@@ -3,6 +3,7 @@ package com.example.spell_compiler.formula;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
@@ -44,15 +45,22 @@ public final class SpellFormulaFiles {
     }
 
     public record SpellOverride(SpellFormulaCatalog.Spell spell, Map<String, JsonElement> advanced,
-                                Map<String, JsonElement> parameters, Map<String, String> formulas) {
+                                Map<String, JsonElement> parameters, Map<String, String> formulas,
+                                Map<String, FormulaAttributes.Config> attributes) {
         public SpellOverride {
             advanced = Map.copyOf(advanced);
             parameters = Map.copyOf(parameters);
             formulas = Map.copyOf(formulas);
+            attributes = Map.copyOf(attributes);
+        }
+
+        public SpellOverride(SpellFormulaCatalog.Spell spell, Map<String, JsonElement> advanced,
+                             Map<String, JsonElement> parameters, Map<String, String> formulas) {
+            this(spell, advanced, parameters, formulas, Map.of());
         }
 
         public boolean isEmpty() {
-            return advanced.isEmpty() && parameters.isEmpty() && formulas.isEmpty();
+            return advanced.isEmpty() && parameters.isEmpty() && formulas.isEmpty() && attributes.isEmpty();
         }
     }
 
@@ -70,33 +78,50 @@ public final class SpellFormulaFiles {
     }
 
     public static List<Diagnostic> exportPack(Path packDirectory, SpellFormulaCatalog catalog) {
+        return exportPack(packDirectory, catalog, true, null);
+    }
+
+    public static List<Diagnostic> exportPack(Path packDirectory, SpellFormulaCatalog catalog, Path diagnosticDirectory) {
+        return exportPack(packDirectory, catalog, true, diagnosticDirectory);
+    }
+
+    private static List<Diagnostic> exportPack(Path packDirectory, SpellFormulaCatalog catalog, boolean overwrite, Path diagnosticDirectory) {
         Path root = packDirectory.toAbsolutePath().normalize();
+        boolean existing = Files.exists(root.resolve("data"));
         List<Diagnostic> diagnostics = new ArrayList<>();
         JsonObject metadata = new JsonObject();
         JsonObject pack = new JsonObject();
-        pack.addProperty("pack_format", 15);
+        pack.addProperty("pack_format", 48);
         JsonObject description = new JsonObject();
         description.addProperty("translate", "pack.spell_compiler.spells");
         pack.add("description", description);
         metadata.add("pack", pack);
-        exportFile(root, root.resolve("pack.mcmeta"), metadata, diagnostics);
+        exportFile(root, root.resolve("pack.mcmeta"), metadata, diagnostics, overwrite);
         Map<String, List<SpellFormulaCatalog.Spell>> paths = resourcePaths(catalog);
         Set<String> ambiguous = ambiguousSpells(paths);
         for (var spell : catalog.spells()) {
             if (ambiguous.contains(spell.id()))
                 diagnostics.add(new Diagnostic(file(root, spell), "多个法术使用相同数据路径，未导出：" + resourceKey(spell)));
-            else exportFile(root, file(root, spell), preview(spell), diagnostics);
+            else exportFile(root, file(root, spell), preview(spell), diagnostics, overwrite);
+        }
+        if (diagnostics.isEmpty()) try {
+            if (overwrite) exportFile(root, root.resolve("spell_compiler-source.json"), FormulaReports.manifest(catalog, false), diagnostics, true);
+            if (diagnosticDirectory != null)
+                FormulaReports.write(diagnosticDirectory, "migration", FormulaReports.migration(root, catalog));
+            if (!overwrite) exportFile(root, root.resolve("spell_compiler-source.json"), FormulaReports.manifest(catalog, existing), diagnostics, false);
+        } catch (IOException | IllegalArgumentException | IllegalStateException failure) {
+            diagnostics.add(new Diagnostic(root, "无法生成数据包迁移报告：" + failure.getMessage(), failure));
         }
         return List.copyOf(diagnostics);
     }
 
-    private static void exportFile(Path root, Path file, JsonElement json, List<Diagnostic> diagnostics) {
-        try { writeMissing(root, file, json); }
+    private static void exportFile(Path root, Path file, JsonElement json, List<Diagnostic> diagnostics, boolean overwrite) {
+        try { writeExportFile(root, file, json, overwrite); }
         catch (IOException failure) { diagnostics.add(new Diagnostic(file, "无法导出法术数据包：" + failure.getMessage(), failure)); }
     }
 
     public static Snapshot exportAndLoad(Path packDirectory, SpellFormulaCatalog catalog) throws IOException {
-        List<Diagnostic> diagnostics = new ArrayList<>(exportPack(packDirectory, catalog));
+        List<Diagnostic> diagnostics = new ArrayList<>(exportPack(packDirectory, catalog, false, null));
         Path root = packDirectory.toAbsolutePath().normalize();
         Map<String, JsonElement> resources = new LinkedHashMap<>();
         Set<String> unreadableResources = new HashSet<>();
@@ -198,9 +223,14 @@ public final class SpellFormulaFiles {
             JsonObject formulas = new JsonObject();
             for (var method : override.spell().editableFormulas()) {
                 String expression = override.formulas().get(method.key());
-                if (expression != null) formulas.addProperty(method.alias(), expression);
+                if (expression != null && override.spell().attributeComponents().stream().noneMatch(component ->
+                        component.binding().equals(method.key()) && override.attributes().containsKey(component.key())))
+                    formulas.addProperty(method.alias(), expression);
             }
             json.add("formulas", formulas);
+            JsonObject attributes = new JsonObject();
+            override.attributes().forEach((name, config) -> attributes.add(name, attributeJson(config)));
+            if (!attributes.isEmpty()) json.add("attributes", attributes);
             String key = resourceKey(override.spell());
             if (resources.putIfAbsent(key, json) != null)
                 throw new IllegalArgumentException("多个法术使用相同数据路径：" + key);
@@ -208,13 +238,16 @@ public final class SpellFormulaFiles {
         return Map.copyOf(resources);
     }
 
-    private static void writeMissing(Path root, Path file, JsonElement json) throws IOException {
+    private static void writeExportFile(Path root, Path file, JsonElement json, boolean overwrite) throws IOException {
         rejectSymbolicPath(root, file);
         Files.createDirectories(file.getParent());
         try {
             Files.writeString(file, GSON.toJson(json) + System.lineSeparator(), StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+                    overwrite ? StandardOpenOption.CREATE : StandardOpenOption.CREATE_NEW,
+                    overwrite ? StandardOpenOption.TRUNCATE_EXISTING : StandardOpenOption.WRITE,
+                    StandardOpenOption.WRITE);
         } catch (FileAlreadyExistsException ignored) {
+            if (overwrite) throw ignored;
         }
     }
 
@@ -235,13 +268,21 @@ public final class SpellFormulaFiles {
     public static SpellOverride parse(SpellFormulaCatalog.Spell spell, JsonElement parsed) {
         if (!parsed.isJsonObject()) throw new IllegalArgumentException("配置根节点必须是对象");
         JsonObject root = parsed.getAsJsonObject();
-        checkKeys(root, Set.of("advanced", "parameters", "formulas"), "根节点");
+        checkKeys(root, Set.of("advanced", "parameters", "formulas", "attributes"), "根节点");
         Map<String, JsonElement> advanced = values(group(root, "advanced"), spell.advanced(), true);
         Map<String, JsonElement> parameters = values(group(root, "parameters"), spell.editableParameters(), false);
         FormulaParameterLimits.validate(spell, advanced, parameters);
         JsonObject formulas = group(root, "formulas");
         Map<String, SpellFormulaCatalog.Method> bindings = new LinkedHashMap<>();
         spell.editableFormulas().forEach(method -> bindings.put(method.alias(), method));
+        spell.formulas().stream().filter(method -> !method.editable() && !method.readOnlyReason().isEmpty())
+                .forEach(method -> bindings.put(method.alias(), method));
+        Map<String, List<String>> replacements = new LinkedHashMap<>();
+        for (var component : spell.damageComponents()) for (String upstream : component.upstreamAliases()) {
+            replacements.computeIfAbsent(upstream, ignored -> new ArrayList<>()).add(component.alias());
+            spell.formulas().stream().filter(method -> method.alias().equals(upstream) && !method.editable())
+                    .findFirst().ifPresent(method -> bindings.put(upstream, method));
+        }
         checkKeys(formulas, bindings.keySet(), "formulas");
         Map<String, String> changedFormulas = new LinkedHashMap<>();
         for (var entry : formulas.entrySet()) {
@@ -253,10 +294,46 @@ public final class SpellFormulaFiles {
             Type result = Type.getReturnType(binding.descriptor());
             FormulaCompiler.validateExpression(expression, types, result.equals(Type.FLOAT_TYPE) || result.equals(Type.DOUBLE_TYPE));
             String resolved = ReadableFormula.resolve(binding.strictExpression(), expression, types).expression();
-            if (!compact(resolved).equals(compact(binding.strictExpression())))
+            if (!compact(resolved).equals(compact(binding.strictExpression()))) {
+                if (!binding.editable())
+                    throw new IllegalArgumentException(!binding.readOnlyReason().isEmpty()
+                            ? "公式入口 formulas." + entry.getKey() + " 已设为只读：" + binding.readOnlyReason()
+                                    + "；旧入口仅接受原始默认公式，请迁移自定义修改"
+                            : "伤害公式入口 formulas." + entry.getKey()
+                            + " 已合并至最终伤害组件 " + String.join(", ", replacements.get(entry.getKey()))
+                            + "；旧入口仅接受原始默认公式，请将修改迁移到最终组件，避免同一路伤害重复计算");
                 changedFormulas.put(binding.key(), expression);
+            }
         }
-        return new SpellOverride(spell, advanced, parameters, changedFormulas);
+        Map<String, FormulaAttributes.Config> changedAttributes = new LinkedHashMap<>();
+        JsonObject attributes = group(root, "attributes");
+        Map<String, FormulaAttributes.Component> components = new LinkedHashMap<>();
+        spell.attributeComponents().forEach(component -> components.put(component.key(), component));
+        checkKeys(attributes, components.keySet(), "attributes");
+        for (var entry : attributes.entrySet()) {
+            var component = components.get(entry.getKey());
+            if (formulas.has(component.alias())) throw new IllegalArgumentException("属性组件同时使用新旧入口：" + entry.getKey());
+            if (!entry.getValue().isJsonObject()) throw new IllegalArgumentException("属性组件必须是对象：" + entry.getKey());
+            var provided = entry.getValue().getAsJsonObject();
+            checkKeys(provided, Set.of("target_attribute", "operation", "formula"), "attributes." + entry.getKey());
+            var binding = spell.formulas().stream().filter(method -> method.key().equals(component.binding())).findFirst().orElseThrow();
+            String target = provided.has("target_attribute") ? requireString(provided.get("target_attribute"), "target_attribute") : component.sourceAttribute();
+            SpellFormulaCatalog.requireId(target);
+            var operation = provided.has("operation") ? FormulaAttributes.Operation.parse(requireString(provided.get("operation"), "operation")) : component.operation();
+            String expression = provided.has("formula") ? requireString(provided.get("formula"), "formula") : binding.readableExpression();
+            if (expression.length() > 8192) throw new IllegalArgumentException("属性公式过长：" + entry.getKey());
+            Map<String, Type> types = new LinkedHashMap<>();
+            binding.variables().forEach((name, type) -> types.put(name, Type.getType(type)));
+            Type result = Type.getReturnType(binding.descriptor());
+            FormulaCompiler.validateExpression(expression, types, result.equals(Type.FLOAT_TYPE) || result.equals(Type.DOUBLE_TYPE));
+            String resolved = ReadableFormula.resolve(binding.strictExpression(), expression, types).expression();
+            if (!target.equals(component.sourceAttribute()) || operation != component.operation()
+                    || !compact(resolved).equals(compact(binding.strictExpression()))) {
+                changedAttributes.put(component.key(), new FormulaAttributes.Config(target, operation, expression));
+                changedFormulas.put(binding.key(), expression);
+            }
+        }
+        return new SpellOverride(spell, advanced, parameters, changedFormulas, changedAttributes);
     }
 
     public static JsonObject preview(SpellFormulaCatalog.Spell spell) {
@@ -264,9 +341,25 @@ public final class SpellFormulaFiles {
         root.add("advanced", spell.advanced().deepCopy());
         root.add("parameters", spell.editableParameters());
         JsonObject formulas = new JsonObject();
-        for (var method : spell.editableFormulas()) formulas.addProperty(method.alias(), method.readableExpression());
+        for (var method : spell.editableFormulas())
+            if (spell.attributeComponents().stream().noneMatch(component -> component.binding().equals(method.key())))
+                formulas.addProperty(method.alias(), method.readableExpression());
         root.add("formulas", formulas);
+        JsonObject attributes = new JsonObject();
+        for (var component : spell.attributeComponents()) {
+            var binding = spell.formulas().stream().filter(method -> method.key().equals(component.binding())).findFirst().orElseThrow();
+            attributes.add(component.key(), attributeJson(new FormulaAttributes.Config(component.sourceAttribute(), component.operation(), binding.readableExpression())));
+        }
+        if (!attributes.isEmpty()) root.add("attributes", attributes);
         return root;
+    }
+
+    private static JsonObject attributeJson(FormulaAttributes.Config config) {
+        JsonObject result = new JsonObject();
+        result.addProperty("target_attribute", config.targetAttribute());
+        result.addProperty("operation", config.operation().id());
+        result.addProperty("formula", config.formula());
+        return result;
     }
 
     private static Map<String, JsonElement> values(JsonObject provided, JsonObject defaults, boolean advanced) {
@@ -347,6 +440,13 @@ public final class SpellFormulaFiles {
     private static JsonElement read(JsonReader reader, int depth) throws IOException {
         if (depth > 32) throw new IllegalArgumentException("JSON 嵌套过深");
         return switch (reader.peek()) {
+            case BEGIN_ARRAY -> {
+                reader.beginArray();
+                JsonArray array = new JsonArray();
+                while (reader.hasNext()) array.add(read(reader, depth + 1));
+                reader.endArray();
+                yield array;
+            }
             case BEGIN_OBJECT -> {
                 reader.beginObject();
                 JsonObject object = new JsonObject();
@@ -398,7 +498,7 @@ public final class SpellFormulaFiles {
         return ambiguous;
     }
 
-    private static void rejectSymbolicPath(Path root, Path file) throws IOException {
+    static void rejectSymbolicPath(Path root, Path file) throws IOException {
         for (Path current = file; current != null && current.startsWith(root); current = current.getParent())
             if (Files.isSymbolicLink(current)) throw new IOException("配置目录中不允许符号链接：" + current);
     }
@@ -409,6 +509,7 @@ public final class SpellFormulaFiles {
             override.advanced().forEach((name, value) -> entries.put(owner + "/advanced/" + name, canonical(value)));
             override.parameters().forEach((name, value) -> entries.put(owner + "/parameters/" + name, canonical(value)));
             override.formulas().forEach((name, value) -> entries.put(owner + "/formulas/" + name, compact(value)));
+            override.attributes().forEach((name, value) -> entries.put(owner + "/attributes/" + name, canonical(attributeJson(value))));
         });
         try {
             byte[] bytes = GSON.toJson(entries).getBytes(StandardCharsets.UTF_8);

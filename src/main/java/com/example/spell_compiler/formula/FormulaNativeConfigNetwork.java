@@ -1,14 +1,18 @@
 package com.example.spell_compiler.formula;
 
+import com.example.spell_compiler.SpellCompiler;
 import net.minecraft.network.FriendlyByteBuf;
-import net.minecraftforge.network.NetworkEvent;
+import net.minecraft.network.VarInt;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.ResourceLocation;
+import net.neoforged.neoforge.network.handling.IPayloadContext;
 
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.function.Supplier;
 
 public final class FormulaNativeConfigNetwork {
     static final int MAX_ENTRIES = 512;
@@ -25,25 +29,35 @@ public final class FormulaNativeConfigNetwork {
         }
     }
 
-    public record Packet(long generation, Map<String, Values> values, String catalogFingerprint) {
+    public record Packet(long generation, Map<String, Values> values, String catalogFingerprint) implements CustomPacketPayload {
+        public static final Type<Packet> TYPE = new Type<>(
+                ResourceLocation.fromNamespaceAndPath(SpellCompiler.MODID, "spell_formula_original_config"));
+        public static final StreamCodec<FriendlyByteBuf, Packet> STREAM_CODEC =
+                StreamCodec.ofMember(Packet::encode, Packet::decode);
+
         public Packet {
             if (generation <= 0 || values == null || values.size() > MAX_ENTRIES)
                 throw new IllegalArgumentException("无效原生法术配置批次");
             catalogFingerprint = requireFingerprint(catalogFingerprint);
             values = Map.copyOf(values);
-            int size = 8 + FriendlyByteBuf.getVarIntSize(MAX_FINGERPRINT_BYTES) + MAX_FINGERPRINT_BYTES
-                    + FriendlyByteBuf.getVarIntSize(values.size());
+            int size = 8 + VarInt.getByteSize(MAX_FINGERPRINT_BYTES) + MAX_FINGERPRINT_BYTES
+                    + VarInt.getByteSize(values.size());
             for (var entry : values.entrySet()) {
                 SpellFormulaCatalog.requireId(entry.getKey());
                 int length = entry.getKey().getBytes(StandardCharsets.UTF_8).length;
                 if (length > MAX_ID_BYTES) throw new IllegalArgumentException("原生法术配置 ID 过长");
-                size += FriendlyByteBuf.getVarIntSize(length) + length + 24;
+                size += VarInt.getByteSize(length) + length + 24;
             }
             if (size > MAX_PACKET_BYTES) throw new IllegalArgumentException("原生法术配置数据过大");
         }
 
         public Packet(long generation, Map<String, Values> values) {
             this(generation, values, SpellFormulaState.catalogFingerprint());
+        }
+
+        @Override
+        public Type<Packet> type() {
+            return TYPE;
         }
 
         public void encode(FriendlyByteBuf buffer) {
@@ -74,17 +88,13 @@ public final class FormulaNativeConfigNetwork {
             return new Packet(generation, values, catalogFingerprint);
         }
 
-        public void handle(Supplier<NetworkEvent.Context> supplier) {
-            var context = supplier.get();
-            context.enqueueWork(() -> {
-                if (!context.getNetworkManager().isConnected()) return;
-                try {
-                    SpellFormulaNetwork.stageOriginalConfig(this);
-                } catch (RuntimeException | LinkageError failure) {
-                    SpellFormulaNetwork.rejectSync(context, failure);
-                }
-            });
-            context.setPacketHandled(true);
+        public void handle(IPayloadContext context) {
+            if (!SpellFormulaNetwork.acceptsConnection(context)) return;
+            try {
+                SpellFormulaNetwork.stageOriginalConfig(this);
+            } catch (RuntimeException | LinkageError failure) {
+                SpellFormulaNetwork.rejectSync(context, failure);
+            }
         }
     }
 

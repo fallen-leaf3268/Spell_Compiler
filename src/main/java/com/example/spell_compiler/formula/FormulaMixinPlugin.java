@@ -5,16 +5,7 @@ import org.apache.logging.log4j.Logger;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
-import org.objectweb.asm.tree.FrameNode;
-import org.objectweb.asm.tree.InsnList;
-import org.objectweb.asm.tree.InsnNode;
-import org.objectweb.asm.tree.JumpInsnNode;
-import org.objectweb.asm.tree.LabelNode;
-import org.objectweb.asm.tree.LdcInsnNode;
-import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
-import org.objectweb.asm.tree.TypeInsnNode;
-import org.objectweb.asm.tree.VarInsnNode;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
 
@@ -28,15 +19,15 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class FormulaMixinPlugin implements IMixinConfigPlugin {
     private static final Logger LOGGER = LogManager.getLogger(FormulaMixinPlugin.class);
-    private static final String DISPATCHER = "com/example/spell_compiler/formula/FormulaRuntimeDispatcher";
-    private static final String INVOKER = DISPATCHER + "$Invoker";
     private static final Map<String, Set<String>> HOOKED_METHODS = new ConcurrentHashMap<>();
+    private static final Set<String> AUTOMATIC_HOOKS = ConcurrentHashMap.newKeySet();
     private Map<String, Set<String>> targets = Map.of();
     private Map<String, SpellFormulaCatalog.Spell> definitions = Map.of();
     private FormulaAddonDiscovery.Discovery addons;
     private final Map<String, Set<String>> compatibilityMethods = new ConcurrentHashMap<>();
     private String mixinPackage;
     private String dynamicMixin;
+    private Set<String> dynamicTargets = Set.of();
 
     public FormulaMixinPlugin() {}
 
@@ -48,19 +39,70 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
     public void onLoad(String mixinPackage) {
         this.mixinPackage = mixinPackage;
         try {
-            initialize(SpellFormulaCatalog.load(FormulaMixinPlugin.class.getClassLoader()));
-        } catch (IOException failure) {
-            throw new IllegalStateException("无法读取原生法术公式目录", failure);
-        }
-        try {
             addons = FormulaAddonDiscovery.discover();
+            initialize(FormulaLoadedCatalog.prepare(FormulaMixinPlugin.class.getClassLoader(), addons));
+            initializeAutomaticSites();
         } catch (IOException | RuntimeException | LinkageError failure) {
-            LOGGER.warn("[SpellFormula] 无法建立附属法术的早期挂钩，本次启动保留原生法术入口", failure);
+            FormulaLoadedCatalog.unavailable();
+            targets = Map.of();
+            definitions = Map.of();
+            dynamicTargets = Set.of();
+            addons = null;
+            FormulaDynamicMixin.restore();
+            LOGGER.warn("[SpellFormula] 无法确认实际法术来源，本次启动保留原生行为", failure);
         }
     }
 
+    private void initializeAutomaticSites() {
+        var repository = addons.repository();
+        var usage = new FormulaUsage(repository, addons.sources());
+        for (var spell : repository.baselineCoverage() ? definitions.values() : List.<SpellFormulaCatalog.Spell>of()) {
+            Set<String> reserved = spell.formulas().stream().filter(method -> method.consumptionFingerprint().isEmpty())
+                    .map(SpellFormulaCatalog.Method::alias).collect(java.util.stream.Collectors.toSet());
+            var exposedMethods = spell.formulas().stream().filter(method -> method.consumptionFingerprint().isEmpty())
+                    .map(method -> new FormulaDataFlow.MethodId(method.declaringClass(), method.name(), method.descriptor()))
+                    .collect(java.util.stream.Collectors.toSet());
+            try {
+                FormulaEffectAttributeControls.register(repository, spell.className());
+                var getters = new com.google.gson.JsonArray();
+                for (var method : spell.formulas()) {
+                    var getter = new com.google.gson.JsonObject();
+                    getter.addProperty("declaringClass", method.declaringClass());
+                    getter.addProperty("name", method.name());
+                    getter.addProperty("descriptor", method.descriptor());
+                    getter.addProperty("alias", method.alias());
+                    getters.add(getter);
+                }
+                FormulaManaRatioBridge.registerGetters(repository, spell.className(), getters);
+                FormulaAutomaticSites.register(FormulaAutomaticSites.scan(repository, spell.className(), reserved, exposedMethods));
+            } catch (RuntimeException | LinkageError failure) {
+                LOGGER.warn("[SpellFormula] {} 无法扫描自动消费入口，保留既有入口", spell.className(), failure);
+            }
+        }
+        for (String name : addons.spellClasses().stream().sorted().toList()) {
+            try {
+                var owner = repository.classNode(name);
+                var metadata = new com.google.gson.JsonObject();
+                metadata.add("parameters", new com.google.gson.JsonObject());
+                FormulaCatalogGenerator.extractSpell(repository, owner, metadata, "", usage, true,
+                        new com.google.gson.JsonArray());
+            } catch (RuntimeException | LinkageError failure) {
+                LOGGER.warn("[SpellFormula] {} 无法扫描附属自动消费入口，保留既有入口", name, failure);
+            }
+        }
+        FormulaManaRatioBridge.initialize(repository);
+        var names = new java.util.LinkedHashSet<String>();
+        addons.spellClasses().stream().map(name -> name.replace('/', '.')).forEach(names::add);
+        if (!repository.baselineCoverage())
+            addons.nativeSpellClasses().stream().map(name -> name.replace('/', '.')).forEach(names::add);
+        FormulaAutomaticSites.targetClasses().stream().filter(name -> !targets.containsKey(name)).forEach(names::add);
+        names.addAll(FormulaManaRatioBridge.targetClasses());
+        names.removeAll(targets.keySet());
+        dynamicTargets = Set.copyOf(names);
+    }
+
     private void initialize(SpellFormulaCatalog catalog) {
-        targets = bindings(catalog);
+        targets = addons != null && !addons.repository().baselineCoverage() ? Map.of() : bindings(catalog);
         Map<String, SpellFormulaCatalog.Spell> values = new LinkedHashMap<>();
         catalog.spells().forEach(spell -> values.put(spell.className(), spell));
         definitions = Map.copyOf(values);
@@ -76,6 +118,9 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
         }
         FormulaSites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
         FormulaConsumerSites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
+        FormulaNumericSites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
+        FormulaEntitySites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
+        FormulaPublishedCorrections.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
         return Map.copyOf(result);
     }
 
@@ -84,7 +129,8 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
-        if (isDynamic(mixinClassName)) return addons != null && addons.spellClasses().contains(targetClassName.replace('.', '/'));
+        if (FormulaLoadedCatalog.disabled()) return false;
+        if (isDynamic(mixinClassName)) return dynamicTargets.contains(targetClassName);
         return targets.containsKey(targetClassName);
     }
 
@@ -95,12 +141,13 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public List<String> getMixins() {
-        if (addons == null || addons.spellClasses().isEmpty()) return null;
+        if (dynamicTargets.isEmpty()) {
+            FormulaDynamicMixin.restore();
+            return null;
+        }
         if (dynamicMixin == null) {
             try {
-                Set<String> names = addons.spellClasses().stream().map(name -> name.replace('/', '.'))
-                        .collect(java.util.stream.Collectors.toSet());
-                dynamicMixin = FormulaDynamicMixin.install(mixinPackage, names);
+                dynamicMixin = FormulaDynamicMixin.install(mixinPackage, dynamicTargets);
             } catch (RuntimeException | LinkageError failure) {
                 FormulaDynamicMixin.restore();
                 LOGGER.warn("[SpellFormula] 无法提供附属法术的动态Mixin资源，本次启动保留原生法术入口", failure);
@@ -114,6 +161,25 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
         return Map.copyOf(HOOKED_METHODS);
     }
 
+    public static Set<String> automaticHooks() {
+        return AUTOMATIC_HOOKS.stream().filter(key -> {
+            var site = FormulaAutomaticSites.find(key);
+            return site == null || switch (site.contextMode()) {
+                case DIRECT -> true;
+                case ENTITY -> FormulaEntityFlow.hasVerifiedSource(site.definition().spellClassName());
+                case SCOPED -> FormulaCastContext.hasVerifiedSource(site.definition().spellClassName());
+            };
+        }).collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
+    private static void applyAutomatic(String targetClassName, ClassNode targetClass) {
+        try {
+            AUTOMATIC_HOOKS.addAll(FormulaAutomaticSites.apply(targetClassName, targetClass));
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.warn("[SpellFormula] {} 自动消费入口校验失败，保留原生行为", targetClassName, failure);
+        }
+    }
+
     private boolean isDynamic(String mixinClassName) {
         return dynamicMixin != null && mixinClassName.equals(mixinPackage + '.' + dynamicMixin);
     }
@@ -121,6 +187,7 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
     @Override
     public void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {
         FormulaDynamicMixin.restore();
+        if (FormulaLoadedCatalog.disabled()) return;
         if (isDynamic(mixinClassName)) {
             applyAddon(targetClassName, targetClass);
             return;
@@ -131,10 +198,14 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
         var missing = new java.util.HashSet<>(selected);
         targetClass.methods.forEach(method -> missing.remove(method.name + method.desc));
         if (!missing.isEmpty()) throw new IllegalStateException("公式目标方法不存在：" + targetClassName + '#' + missing);
+        applyAutomatic(targetClassName, targetClass);
         FormulaDurationSites.apply(targetClass, definition);
         FormulaDirectPowerSites.apply(targetClass, definition);
         FormulaSites.apply(targetClassName, targetClass);
         FormulaConsumerSites.apply(targetClassName, targetClass);
+        FormulaNumericSites.apply(targetClassName, targetClass);
+        FormulaEntitySites.apply(targetClassName, targetClass);
+        FormulaPublishedCorrections.apply(targetClassName, targetClass);
         List<MethodNode> updated = new ArrayList<>(targetClass.methods);
         var unmatched = new java.util.HashSet<>(selected);
         for (int index = 0; index < updated.size(); index++) {
@@ -147,31 +218,62 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
             if (result.getSort() != Type.INT && result.getSort() != Type.LONG
                     && result.getSort() != Type.FLOAT && result.getSort() != Type.DOUBLE)
                 throw new IllegalStateException("公式目标不是数值方法：" + targetClassName + '#' + key);
-            MethodNode replacement = copy(method);
             var binding = definition.formulas().stream().filter(value -> value.key().equals(key)).findFirst().orElseThrow();
-            FormulaMethodCompatibility.recordOriginal(targetClass.name, replacement);
-            prependGuard(targetClass.name, replacement, FormulaDurationSites.isDuration(binding));
-            protectCastReturns(replacement);
-            if ((method.access & Opcodes.ACC_STATIC) == 0
-                    && (result.getSort() == Type.FLOAT || result.getSort() == Type.DOUBLE))
-                protectFiniteReturns(targetClass.name, replacement, result);
+            MethodNode replacement = FormulaMethodInstrumentation.instrument(targetClass.name, method,
+                    FormulaMethodInstrumentation.TargetKind.BASELINE, FormulaDurationSites.isDuration(binding));
             updated.set(index, replacement);
             unmatched.remove(key);
         }
         if (!unmatched.isEmpty()) throw new IllegalStateException("公式目标方法不存在：" + targetClassName + '#' + unmatched);
         targetClass.methods = updated;
         compatibilityMethods.put(targetClass.name, Set.copyOf(selected));
+        applyDamageTooltips(targetClass, definition);
     }
 
     @Override
     public void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {
+        FormulaManaRatioBridge.verify(targetClassName, targetClass);
+        if (!FormulaEntityFlow.verifyCaptureHooks(targetClassName, targetClass))
+            LOGGER.warn("[SpellFormula] {} 实体施法来源挂钩未保留，隐藏关联的实体公式", targetClassName);
+        if (!FormulaCastContext.verifyRootHooks(targetClassName, targetClass))
+            LOGGER.warn("[SpellFormula] {} 同步施法上下文挂钩未保留，隐藏关联的辅助方法公式", targetClassName);
+        FormulaAutomaticHookRetention.pruneMissing(targetClassName, targetClass, AUTOMATIC_HOOKS,
+                key -> LOGGER.warn("[SpellFormula] {} 自动消费挂钩未保留，隐藏该入口", key));
         Set<String> selected = compatibilityMethods.get(targetClass.name);
         if (selected == null) return;
         FormulaMethodCompatibility.observeTransformed(targetClass, selected);
     }
 
+
     private void applyAddon(String targetClassName, ClassNode targetClass) {
-        if (addons == null || !addons.spellClasses().contains(targetClass.name)) return;
+        if (addons == null) return;
+        applyAutomatic(targetClassName, targetClass);
+        try {
+            FormulaManaRatioBridge.apply(targetClassName, targetClass, addons.repository());
+        } catch (RuntimeException | LinkageError failure) {
+            FormulaManaRatioBridge.failed(targetClassName, failure.toString());
+            LOGGER.warn("[SpellFormula] {} 无法确认回魔效果消费，保留原生行为并隐藏该入口", targetClassName, failure);
+        }
+        if (!addons.spellClasses().contains(targetClass.name)
+                && (!addons.nativeSpellClasses().contains(targetClass.name) || addons.repository().baselineCoverage())) return;
+        boolean nativeSpell = addons.nativeSpellClasses().contains(targetClass.name) && !addons.repository().baselineCoverage();
+        var definition = definitions.get(targetClassName);
+        if (nativeSpell && definition != null) {
+            var protectedClass = new ClassNode();
+            targetClass.accept(protectedClass);
+            try {
+                FormulaDurationSites.apply(protectedClass, definition);
+                targetClass.methods = protectedClass.methods;
+            } catch (RuntimeException | LinkageError failure) {
+                LOGGER.warn("[SpellFormula] {} 无法确认原生数值返回保护，保留实际原始方法", targetClassName, failure);
+            }
+        }
+        Set<String> numeric = Set.of();
+        try {
+            numeric = FormulaAddonNumericSites.apply(targetClassName, targetClass);
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.warn("[SpellFormula] {} 无法接入附属消费数值，本次启动保留这些数值的原生行为", targetClassName, failure);
+        }
         Set<String> selected = new java.util.LinkedHashSet<>();
         List<MethodNode> updated = new ArrayList<>(targetClass.methods);
         for (int index = 0; index < updated.size(); index++) {
@@ -183,9 +285,15 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
                     || method.instructions.size() == 0) continue;
             String key = method.name + method.desc;
             try {
-                MethodNode replacement = copy(method);
-                FormulaMethodCompatibility.recordOriginal(targetClass.name, replacement);
-                prependGuard(targetClass.name, replacement, false, true);
+                var binding = definition == null ? null : definition.formulas().stream()
+                        .filter(value -> value.key().equals(key)).findFirst().orElse(null);
+                boolean duration = nativeSpell && binding != null && FormulaDurationSites.isDuration(binding)
+                        && method.desc.equals("(ILnet/minecraft/world/entity/LivingEntity;)" + result.getDescriptor())
+                        && (method.access & Opcodes.ACC_STATIC) == 0
+                        && (result.getSort() == Type.INT || result.getSort() == Type.FLOAT);
+                var targetKind = nativeSpell ? FormulaMethodInstrumentation.TargetKind.DISCOVERED_NATIVE
+                        : FormulaMethodInstrumentation.TargetKind.ADDON;
+                MethodNode replacement = FormulaMethodInstrumentation.instrument(targetClass.name, method, targetKind, duration);
                 updated.set(index, replacement);
                 selected.add(key);
             } catch (RuntimeException | LinkageError failure) {
@@ -194,183 +302,18 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
         }
         targetClass.methods = updated;
         compatibilityMethods.put(targetClass.name, Set.copyOf(selected));
-        HOOKED_METHODS.put(targetClassName, Set.copyOf(selected));
+        Set<String> available = new java.util.LinkedHashSet<>(selected);
+        available.addAll(numeric);
+        HOOKED_METHODS.put(targetClassName, Set.copyOf(available));
+        applyDamageTooltips(targetClass, definition);
     }
 
-    private static MethodNode copy(MethodNode original) {
-        MethodNode result = new MethodNode(Opcodes.ASM9, original.access, original.name, original.desc,
-                original.signature, original.exceptions == null ? null : original.exceptions.toArray(String[]::new));
-        original.accept(result);
-        return result;
+    private void applyDamageTooltips(ClassNode target, SpellFormulaCatalog.Spell definition) {
+        try {
+            FormulaDamageTooltips.apply(target, definition, addons == null ? FormulaClassRepository.of(target) : addons.repository());
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.warn("[SpellFormula] {} 无法确认伤害或属性说明来源，保留原生说明", target.name, failure);
+        }
     }
 
-    private static void prependGuard(String owner, MethodNode method, boolean duration) {
-        prependGuard(owner, method, duration, false);
-    }
-
-    private static void prependGuard(String owner, MethodNode method, boolean duration, boolean dynamicReceiver) {
-        Type[] arguments = Type.getArgumentTypes(method.desc);
-        boolean isStatic = (method.access & Opcodes.ACC_STATIC) != 0;
-        int slot = isStatic ? 0 : 1;
-        int actor = -1;
-        int[] slots = new int[arguments.length];
-        for (int index = 0; index < arguments.length; index++) {
-            slots[index] = slot;
-            if (actor < 0 && arguments[index].getSort() == Type.OBJECT
-                    && arguments[index].getInternalName().startsWith("net/minecraft/world/entity/")) actor = slot;
-            slot += arguments[index].getSize();
-        }
-        int invokerSlot = Math.max(method.maxLocals, slot);
-        InsnList prefix = new InsnList();
-        if (dynamicReceiver) {
-            prefix.add(new LdcInsnNode(owner.replace('/', '.')));
-            prefix.add(new LdcInsnNode(method.name + method.desc));
-            prefix.add(isStatic ? new InsnNode(Opcodes.ACONST_NULL) : new VarInsnNode(Opcodes.ALOAD, 0));
-            prefix.add(actor < 0 ? new InsnNode(Opcodes.ACONST_NULL) : new VarInsnNode(Opcodes.ALOAD, actor));
-            prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, DISPATCHER, "resolveDeclared",
-                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)L" + INVOKER + ';', false));
-        } else {
-            prefix.add(new LdcInsnNode(owner.replace('/', '.') + '#' + method.name + method.desc));
-            prefix.add(actor < 0 ? new InsnNode(Opcodes.ACONST_NULL) : new VarInsnNode(Opcodes.ALOAD, actor));
-            prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, DISPATCHER, "resolve",
-                    "(Ljava/lang/String;Ljava/lang/Object;)L" + INVOKER + ';', false));
-        }
-        prefix.add(new VarInsnNode(Opcodes.ASTORE, invokerSlot));
-        prefix.add(new VarInsnNode(Opcodes.ALOAD, invokerSlot));
-        LabelNode original = new LabelNode();
-        prefix.add(new JumpInsnNode(Opcodes.IFNULL, original));
-        prefix.add(new VarInsnNode(Opcodes.ALOAD, invokerSlot));
-        prefix.add(isStatic ? new InsnNode(Opcodes.ACONST_NULL) : new VarInsnNode(Opcodes.ALOAD, 0));
-        prefix.add(new LdcInsnNode(arguments.length));
-        prefix.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/Object"));
-        for (int index = 0; index < arguments.length; index++) {
-            Type argument = arguments[index];
-            prefix.add(new InsnNode(Opcodes.DUP));
-            prefix.add(new LdcInsnNode(index));
-            prefix.add(new VarInsnNode(argument.getOpcode(Opcodes.ILOAD), slots[index]));
-            box(prefix, argument);
-            prefix.add(new InsnNode(Opcodes.AASTORE));
-        }
-        prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, DISPATCHER, "invoke",
-                "(L" + INVOKER + ";Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Number;", false));
-        int resultSlot = invokerSlot + 1;
-        prefix.add(new VarInsnNode(Opcodes.ASTORE, resultSlot));
-        prefix.add(new VarInsnNode(Opcodes.ALOAD, resultSlot));
-        prefix.add(new JumpInsnNode(Opcodes.IFNULL, original));
-        prefix.add(new VarInsnNode(Opcodes.ALOAD, resultSlot));
-        Type result = Type.getReturnType(method.desc);
-        prefix.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Number", result.getClassName() + "Value",
-                "()" + result.getDescriptor(), false));
-        if (duration) {
-            prefix.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            prefix.add(new LdcInsnNode(method.name + method.desc));
-            prefix.add(new VarInsnNode(Opcodes.ILOAD, 1));
-            prefix.add(new VarInsnNode(Opcodes.ALOAD, 2));
-            prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
-                    "com/example/spell_compiler/formula/FormulaDurationSafety",
-                    result.getSort() == Type.INT ? "validateOverrideInt" : "validateOverrideFloat",
-                    '(' + result.getDescriptor() + "Ljava/lang/Object;Ljava/lang/String;ILjava/lang/Object;)"
-                            + result.getDescriptor(), false));
-        }
-        prefix.add(new InsnNode(result.getOpcode(Opcodes.IRETURN)));
-        prefix.add(original);
-        boolean expanded = false;
-        for (var instruction : method.instructions)
-            if (instruction instanceof FrameNode frame && frame.type == Opcodes.F_NEW) expanded = true;
-        List<Object> locals = initialLocals(owner, method);
-        prefix.add(expanded ? new FrameNode(Opcodes.F_NEW, locals.size(), locals.toArray(), 0, null)
-                : new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
-        method.instructions.insert(prefix);
-        method.maxLocals = resultSlot + 1;
-        method.maxStack = Math.max(method.maxStack, 8);
-    }
-
-    private static void protectCastReturns(MethodNode method) {
-        boolean cast = (method.name + method.desc).equals("getCastTime(I)I");
-        boolean effective = (method.name + method.desc).equals("getEffectiveCastTime(ILnet/minecraft/world/entity/LivingEntity;)I");
-        if (!cast && !effective) return;
-        for (var instruction : method.instructions.toArray()) {
-            if (instruction.getOpcode() != Opcodes.IRETURN) continue;
-            InsnList code = new InsnList();
-            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            code.add(new VarInsnNode(Opcodes.ILOAD, 1));
-            if (effective) code.add(new VarInsnNode(Opcodes.ALOAD, 2));
-            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "com/example/spell_compiler/formula/FormulaCastSafety",
-                    effective ? "guardEffectiveCastTime" : "guardCastTime",
-                    effective ? "(ILjava/lang/Object;ILjava/lang/Object;)I" : "(ILjava/lang/Object;I)I", false));
-            method.instructions.insertBefore(instruction, code);
-        }
-        method.maxStack += effective ? 3 : 2;
-    }
-
-    private static void protectFiniteReturns(String owner, MethodNode method, Type result) {
-        Type[] arguments = Type.getArgumentTypes(method.desc);
-        boolean expanded = false;
-        for (var instruction : method.instructions)
-            if (instruction instanceof FrameNode frame && frame.type == Opcodes.F_NEW) expanded = true;
-        for (var instruction : method.instructions.toArray()) {
-            if (instruction.getOpcode() != result.getOpcode(Opcodes.IRETURN)) continue;
-            InsnList code = new InsnList();
-            code.add(new InsnNode(result.getSize() == 1 ? Opcodes.DUP : Opcodes.DUP2));
-            String wrapper = result.getSort() == Type.FLOAT ? "java/lang/Float" : "java/lang/Double";
-            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, wrapper, "isFinite", '(' + result.getDescriptor() + ")Z", false));
-            LabelNode finite = new LabelNode();
-            code.add(new JumpInsnNode(Opcodes.IFNE, finite));
-            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            code.add(new LdcInsnNode(method.name + method.desc));
-            code.add(new LdcInsnNode(arguments.length));
-            code.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/Object"));
-            int slot = 1;
-            for (int index = 0; index < arguments.length; index++) {
-                code.add(new InsnNode(Opcodes.DUP));
-                code.add(new LdcInsnNode(index));
-                code.add(new VarInsnNode(arguments[index].getOpcode(Opcodes.ILOAD), slot));
-                box(code, arguments[index]);
-                code.add(new InsnNode(Opcodes.AASTORE));
-                slot += arguments[index].getSize();
-            }
-            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "com/example/spell_compiler/formula/FormulaRuntimeHooks",
-                    result.getSort() == Type.FLOAT ? "finiteFloat" : "finiteDouble",
-                    '(' + result.getDescriptor() + "Ljava/lang/Object;Ljava/lang/String;[Ljava/lang/Object;)"
-                            + result.getDescriptor(), false));
-            code.add(finite);
-            List<Object> locals = initialLocals(owner, method);
-            code.add(new FrameNode(expanded ? Opcodes.F_NEW : Opcodes.F_FULL, locals.size(), locals.toArray(),
-                    1, new Object[]{result.getSort() == Type.FLOAT ? Opcodes.FLOAT : Opcodes.DOUBLE}));
-            method.instructions.insertBefore(instruction, code);
-        }
-        method.maxStack = Math.max(method.maxStack, 10);
-    }
-
-    private static List<Object> initialLocals(String owner, MethodNode method) {
-        List<Object> locals = new ArrayList<>();
-        if ((method.access & Opcodes.ACC_STATIC) == 0) locals.add(owner);
-        for (Type type : Type.getArgumentTypes(method.desc)) {
-            locals.add(switch (type.getSort()) {
-                case Type.BOOLEAN, Type.BYTE, Type.CHAR, Type.SHORT, Type.INT -> Opcodes.INTEGER;
-                case Type.LONG -> Opcodes.LONG;
-                case Type.FLOAT -> Opcodes.FLOAT;
-                case Type.DOUBLE -> Opcodes.DOUBLE;
-                case Type.ARRAY -> type.getDescriptor();
-                default -> type.getInternalName();
-            });
-        }
-        return locals;
-    }
-
-    private static void box(InsnList instructions, Type type) {
-        String wrapper = switch (type.getSort()) {
-            case Type.BOOLEAN -> "java/lang/Boolean";
-            case Type.BYTE -> "java/lang/Byte";
-            case Type.CHAR -> "java/lang/Character";
-            case Type.SHORT -> "java/lang/Short";
-            case Type.INT -> "java/lang/Integer";
-            case Type.LONG -> "java/lang/Long";
-            case Type.FLOAT -> "java/lang/Float";
-            case Type.DOUBLE -> "java/lang/Double";
-            default -> null;
-        };
-        if (wrapper != null) instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, wrapper, "valueOf",
-                '(' + type.getDescriptor() + ")L" + wrapper + ';', false));
-    }
 }
