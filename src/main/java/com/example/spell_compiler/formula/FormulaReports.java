@@ -64,7 +64,14 @@ public final class FormulaReports {
                 binding.addProperty("alias", method.alias());
                 binding.addProperty("method", method.key());
                 binding.addProperty("identity", method.consumptionFingerprint());
-                if (method.consumptionFingerprint().startsWith("EFFECT_ATTRIBUTE:")) binding.addProperty("unit", "percent");
+                var component = spell.attributeComponents().stream()
+                        .filter(value -> value.binding().equals(method.key())).findFirst();
+                if (component.isPresent() || method.consumptionFingerprint().startsWith("EFFECT_ATTRIBUTE:")) {
+                    var operation = component.map(value -> override != null && override.attributes().containsKey(value.key())
+                            ? override.attributes().get(value.key()).operation() : value.operation())
+                            .orElse(FormulaAttributes.Operation.MULTIPLY_TOTAL);
+                    binding.addProperty("unit", operation == FormulaAttributes.Operation.ADDITION ? "attribute_value" : "percent");
+                }
                 boolean configured = override != null && override.formulas().containsKey(method.key());
                 binding.addProperty("state", !configured ? "not_configured"
                         : disabled.contains(FormulaRuntimeDispatcher.key(spell.className(), method.key()))

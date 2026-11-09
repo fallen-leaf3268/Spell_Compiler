@@ -9,7 +9,6 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.*;
 
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -90,6 +89,7 @@ public final class FormulaDamageTooltips {
     }
 
     static void apply(ClassNode target, SpellFormulaCatalog.Spell spell, FormulaClassRepository repository) {
+        FormulaTooltipFormatting.apply(target, repository);
         if (spell == null || spell.attributeComponents().isEmpty() && spell.damageComponents().isEmpty() && spell.formulas().stream()
                 .noneMatch(binding -> binding.consumptionFingerprint().startsWith("EFFECT_ATTRIBUTE:"))) return;
         var original = target.methods.stream().filter(method -> method.name.equals("getUniqueInfo") && method.desc.equals(INFO)
@@ -406,7 +406,7 @@ public final class FormulaDamageTooltips {
             case "ADD_MULTIPLIED_TOTAL" -> "2";
             default -> throw new IllegalArgumentException("不支持的属性操作：" + definition.operation());
         };
-        String amount = BigDecimal.valueOf(Math.abs(value.doubleValue())).stripTrailingZeros().toPlainString();
+        String amount = FormulaNumberFormatting.magnitude(value);
         return Component.translatable("attribute.modifier." + (value.doubleValue() < 0 ? "take." : "plus.") + operation, amount, description);
     }
 
@@ -427,6 +427,6 @@ public final class FormulaDamageTooltips {
         Object[] inputs = site == null || site.inputs().isEmpty() ? null : new Object[site.inputs().size()];
         Number value = FormulaNumericHooks.evaluate(definition, 0, spell, level, caster, inputs);
         return value == null ? null : Component.translatable(adjustment ? "ui.spell_compiler.damage_adjustment" : "ui.irons_spellbooks.damage",
-                BigDecimal.valueOf(value.doubleValue()).stripTrailingZeros().toPlainString());
+                FormulaNumberFormatting.format(value));
     }
 }

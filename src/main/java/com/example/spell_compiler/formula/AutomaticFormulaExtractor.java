@@ -667,14 +667,6 @@ public final class AutomaticFormulaExtractor {
                     && attributeValueCall(nonnull.get(2)) && nonnull.get(3).getOpcode() == Opcodes.D2F) {
                 name = "summon_damage";
                 actor = nonnull.get(0);
-            } else if (nonnull.size() == 5
-                    && fieldMatches(nonnull.get(0), SPELL_REGISTRY, "FROSTBITE_SPELL", "Ljava/util/function/Supplier;")
-                    && callMatches(nonnull.get(1), Opcodes.INVOKEINTERFACE, "java/util/function/Supplier", "get", "()Ljava/lang/Object;")
-                    && castMatches(nonnull.get(2), ABSTRACT_SPELL) && sameActor(nonnull.get(3), subject)
-                    && callMatches(nonnull.get(4), Opcodes.INVOKEVIRTUAL, ABSTRACT_SPELL,
-                    "getEntityPowerMultiplier", "(L" + LIVING_ENTITY + ";)F")) {
-                name = "frostbite_power_multiplier";
-                actor = nonnull.get(3);
             } else return -1;
             flushOperandValues();
             var code = new ArrayList<AbstractInsnNode>(subject.instructions());

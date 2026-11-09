@@ -70,7 +70,8 @@ public final class FormulaFixedMixinPlugin implements IMixinConfigPlugin {
 
     private static boolean optional(String mixin) {
         return mixin.endsWith("FormulaSacrificeMixin") || mixin.endsWith("FormulaNumberFormattingMixin")
-                || mixin.endsWith("AttributesLibClientMixin") || mixin.endsWith("FormulaConsumerMixin$Tooltips");
+                || mixin.endsWith("AttributesLibClientMixin") || mixin.endsWith("FormulaConsumerMixin$Tooltips")
+                || mixin.endsWith("FormulaTooltipTimeMixin");
     }
 
     private static ClassNode read(String name) {
@@ -102,6 +103,13 @@ public final class FormulaFixedMixinPlugin implements IMixinConfigPlugin {
                         .anyMatch(instruction -> instruction instanceof LdcInsnNode constant && constant.cst.equals("ui.irons_spellbooks.radius")), "半径提示入口不存在");
             } else if (mixin.endsWith("FormulaNumberFormattingMixin")) {
                 method(node, "stringTruncation", "(DI)Ljava/lang/String;", true);
+            } else if (mixin.endsWith("FormulaTooltipTimeMixin")) {
+                for (String name : List.of("formatActiveSpellTooltip", "formatScrollTooltip")) {
+                    var matching = node.methods.stream().filter(value -> value.name.equals(name)).toList();
+                    require(matching.size() == 1, "法术说明方法缺失或重载不符：" + name);
+                    calls(node, matching.get(0), "io/redspace/ironsspellbooks/api/util/Utils", "timeFromTicks",
+                            "(FI)Ljava/lang/String;", 1, -1);
+                }
             } else if (mixin.endsWith("FormulaConsumerMixin$EffectData")) {
                 field(node, "hiddenEffect", EFFECT);
                 field(node, "duration", "I");

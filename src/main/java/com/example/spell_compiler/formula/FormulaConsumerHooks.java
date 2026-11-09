@@ -325,8 +325,17 @@ public final class FormulaConsumerHooks {
             }
         }
         carrier.apoth$setFormulaValues(values);
-        carrier.apoth$setAttributeValues(ops.get(encoded, FormulaAttributeRuntime.DATA_KEY).result()
-                .map(value -> FormulaAttributeRuntime.read((CompoundTag) ops.convertTo(NbtOps.INSTANCE, value))).orElseGet(Map::of));
+        try {
+            var attributes = ops.get(encoded, FormulaAttributeRuntime.DATA_KEY).result();
+            var stored = attributes.map(value -> ops.convertTo(NbtOps.INSTANCE, value)).orElseGet(CompoundTag::new);
+            if (!(stored instanceof CompoundTag compound)) throw new IllegalArgumentException("Attribute snapshot must be a compound");
+            carrier.apoth$setAttributeValues(FormulaAttributeRuntime.read(compound));
+        } catch (IllegalArgumentException | net.minecraft.ResourceLocationException invalid) {
+            if (FormulaEffectStreamCodec.decoding()) throw invalid;
+            carrier.apoth$setAttributeValues(Map.of());
+            if (ATTRIBUTE_FAILURES.add("persisted:" + id))
+                SpellCompiler.LOGGER.warn("[SpellFormula] 忽略不再兼容的持久化属性快照，保留原生效果：{}", id, invalid);
+        }
         var source = ops.get(encoded, FormulaEntityContext.DATA_KEY).result()
                 .map(value -> FormulaEntityContext.decodeSource(ops, value)).orElseGet(CompoundTag::new);
         carrier.apoth$setFormulaSource(source);

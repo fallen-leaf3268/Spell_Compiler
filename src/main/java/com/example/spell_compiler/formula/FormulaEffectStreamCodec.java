@@ -8,7 +8,10 @@ import net.neoforged.neoforge.network.connection.ConnectionType;
 import java.util.Objects;
 
 public final class FormulaEffectStreamCodec {
+    private static final ThreadLocal<Boolean> DECODING = new ThreadLocal<>();
     private FormulaEffectStreamCodec() {}
+
+    static boolean decoding() { return Boolean.TRUE.equals(DECODING.get()); }
 
     public static StreamCodec<RegistryFriendlyByteBuf, MobEffectInstance> create(
             StreamCodec<RegistryFriendlyByteBuf, MobEffectInstance> original) {
@@ -19,7 +22,15 @@ public final class FormulaEffectStreamCodec {
             public MobEffectInstance decode(RegistryFriendlyByteBuf buffer) {
                 return switch (buffer.readUnsignedByte()) {
                     case 0 -> original.decode(buffer);
-                    case 1 -> extended.decode(buffer);
+                    case 1 -> {
+                        Boolean previous = DECODING.get();
+                        DECODING.set(true);
+                        try { yield extended.decode(buffer); }
+                        finally {
+                            if (previous == null) DECODING.remove();
+                            else DECODING.set(previous);
+                        }
+                    }
                     default -> throw new IllegalArgumentException("Unknown formula effect stream mode");
                 };
             }
