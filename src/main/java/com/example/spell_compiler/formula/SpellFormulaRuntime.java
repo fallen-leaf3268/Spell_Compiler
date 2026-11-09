@@ -1,32 +1,28 @@
 package com.example.spell_compiler.formula;
 
 import com.example.spell_compiler.SpellCompiler;
-import com.example.spell_compiler.mixin.ModifySpellConfigAccessor;
 import com.google.gson.JsonElement;
-import io.redspace.ironsspellbooks.api.config.ModifyDefaultConfigValuesEvent;
-import io.redspace.ironsspellbooks.api.config.SpellConfigHolder;
-import io.redspace.ironsspellbooks.api.config.SpellConfigManager;
-import io.redspace.ironsspellbooks.api.config.SpellConfigParameter;
 import io.redspace.ironsspellbooks.api.registry.SchoolRegistry;
 import io.redspace.ironsspellbooks.api.registry.SpellRegistry;
 import io.redspace.ironsspellbooks.api.spells.AbstractSpell;
-import io.redspace.ironsspellbooks.api.spells.SpellRarity;
-import io.redspace.ironsspellbooks.network.SyncJsonConfigPacket;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.AddReloadListenerEvent;
+import net.minecraftforge.event.OnDatapackSyncEvent;
+import net.minecraftforge.event.server.ServerAboutToStartEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.fml.util.thread.EffectiveSide;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.ref.WeakReference;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -39,11 +35,48 @@ public final class SpellFormulaRuntime {
     private static boolean serverActive;
     private static boolean clientActive;
     private static boolean addonsInitialized;
+    private static final PendingServer PENDING_SERVER = new PendingServer();
 
     private record ChangedField(AbstractSpell spell, String field) {}
 
     private record Prepared(SpellFormulaFiles.Snapshot snapshot,
                             Map<String, FormulaRuntimeDispatcher.Invoker> invokers) {}
+
+    private record SavedField(AbstractSpell spell, Field field, int value) {}
+
+    private record CommitState(SpellFormulaFiles.Snapshot server, SpellFormulaFiles.Snapshot client,
+                               boolean serverActive, boolean clientActive,
+                               FormulaRuntimeDispatcher.Installed bindings, FormulaNativeValues.ConfigState nativeConfig,
+                               List<SavedField> fields, Set<ChangedField> modified) {}
+
+    static final class PendingServer {
+        private record Candidate(WeakReference<Object> owner, SpellFormulaFiles.Snapshot snapshot) {}
+        private final List<Candidate> candidates = new ArrayList<>();
+
+        void stage(SpellFormulaFiles.Snapshot requested, Object resources) {
+            if (resources == null) throw new IllegalArgumentException("Unloaded server configuration requires an actual reload resource owner");
+            java.util.Objects.requireNonNull(requested);
+            candidates.removeIf(candidate -> candidate.owner().get() == null || candidate.owner().get() == resources);
+            candidates.add(new Candidate(new WeakReference<>(resources), requested));
+        }
+
+        SpellFormulaFiles.Snapshot take(Object resources) {
+            var iterator = candidates.iterator();
+            while (iterator.hasNext()) {
+                var candidate = iterator.next();
+                Object source = candidate.owner().get();
+                if (source == null || source == resources) {
+                    iterator.remove();
+                    if (source != null) return candidate.snapshot();
+                }
+            }
+            return null;
+        }
+
+        void clear() {
+            candidates.clear();
+        }
+    }
 
     private SpellFormulaRuntime() {}
 
@@ -55,15 +88,30 @@ public final class SpellFormulaRuntime {
         } catch (IOException failure) {
             throw new IllegalStateException("无法加载法术公式目录", failure);
         }
-        MinecraftForge.EVENT_BUS.addListener(SpellFormulaRuntime::modifyConfig);
+        FormulaSpellConfig.initialize();
         MinecraftForge.EVENT_BUS.addListener(SpellFormulaRuntime::addReloadListener);
+        MinecraftForge.EVENT_BUS.addListener(SpellFormulaRuntime::serverAboutToStart);
+        MinecraftForge.EVENT_BUS.addListener(EventPriority.HIGHEST, SpellFormulaRuntime::commitReload);
         MinecraftForge.EVENT_BUS.addListener(SpellFormulaRuntime::serverStopped);
         registered = true;
         SpellCompiler.LOGGER.info("[SpellFormula] 已注册 {} 个原生法术的数据包公式入口。", SpellFormulaState.catalog().spells().size());
     }
 
     private static void addReloadListener(AddReloadListenerEvent event) {
-        event.addListener(new SpellFormulaReloadListener());
+        event.addListener(new SpellFormulaReloadListener(event.getServerResources()));
+    }
+
+    private static synchronized void serverAboutToStart(ServerAboutToStartEvent event) {
+        var requested = PENDING_SERVER.take(event.getServer().getServerResources().managers());
+        if (requested == null) return;
+        if (!FormulaSpellConfig.ready()) throw new IllegalStateException("Native spell configuration is not loaded before server startup");
+        applyServer(requested);
+    }
+
+    private static synchronized void commitReload(OnDatapackSyncEvent event) {
+        if (event.getPlayer() != null) return;
+        var requested = PENDING_SERVER.take(event.getPlayerList().getServer().getServerResources().managers());
+        if (requested != null) applyServer(requested);
     }
 
     public static synchronized void initializeAddons() {
@@ -73,7 +121,7 @@ public final class SpellFormulaRuntime {
         for (var spell : registry.getValues()) registeredSpells.put(registry.getKey(spell), spell);
         var current = SpellFormulaState.catalog();
         var discovered = FormulaAddonCatalog.discover(current, registeredSpells,
-                FormulaAddonDiscovery.current(), FormulaMixinPlugin.hookedMethods());
+                FormulaAddonDiscovery.current(), FormulaMixinPlugin.hookedMethods(), FormulaMixinPlugin.automaticHooks());
         SpellFormulaState.replaceCatalog(discovered.catalog());
         FormulaRuntimeHooks.initialize(discovered.catalog());
         addonsInitialized = true;
@@ -96,20 +144,24 @@ public final class SpellFormulaRuntime {
     }
 
     public static synchronized SpellFormulaFiles.Snapshot applyServer(SpellFormulaFiles.Snapshot requested) {
+        if (!FormulaSpellConfig.ready()) throw new IllegalStateException("Native spell configuration is not loaded");
         Prepared prepared = prepare(requested);
-        validateSnapshot(prepared.snapshot());
-        FormulaRuntimeHooks.clearParameterFailures();
-        FormulaRuntimeDispatcher.replaceServer(prepared.invokers());
-        SpellFormulaState.publishServer(prepared.snapshot());
-        serverActive = true;
-        applyActiveFields();
-        SpellConfigManager.getInstance().handleServerConfigUpdate();
-        SpellRegistry.onConfigReload();
+        validateSnapshot(prepared);
+        commit(prepared, false, Set.of());
         log(prepared.snapshot());
         return prepared.snapshot();
     }
 
+    static synchronized SpellFormulaFiles.Snapshot applyServer(SpellFormulaFiles.Snapshot requested, Object resourceOwner) {
+        PENDING_SERVER.stage(requested, resourceOwner);
+        return requested;
+    }
+
     public static synchronized SpellFormulaFiles.Snapshot applyClient(SpellFormulaFiles.Snapshot requested) {
+        return applyClient(requested, Set.of());
+    }
+
+    static synchronized SpellFormulaFiles.Snapshot applyClient(SpellFormulaFiles.Snapshot requested, Set<String> disabled) {
         Prepared prepared = prepare(requested);
         if (!prepared.snapshot().fingerprint().equals(requested.fingerprint())) {
             prepared.snapshot().diagnostics().forEach(SpellFormulaRuntime::logDiagnostic);
@@ -117,24 +169,23 @@ public final class SpellFormulaRuntime {
                     .filter(java.util.Objects::nonNull).findFirst().orElse(null);
             throw new IllegalArgumentException("服务器法术配置未能完整编译，已保留上一次完整配置", cause);
         }
-        validateSnapshot(prepared.snapshot());
-        FormulaRuntimeHooks.clearParameterFailures();
-        FormulaRuntimeDispatcher.replaceClient(prepared.invokers());
-        SpellFormulaState.publishClient(prepared.snapshot());
-        clientActive = true;
-        if (!serverActive) applyActiveFields();
-        SpellRegistry.onConfigReload();
+        validateSnapshot(prepared);
+        if (!prepared.invokers().keySet().containsAll(disabled))
+            throw new IllegalArgumentException("服务器停用列表包含未安装公式");
+        commit(prepared, true, disabled);
         log(prepared.snapshot());
         return prepared.snapshot();
     }
 
     public static synchronized void resetServer() {
+        PENDING_SERVER.clear();
         boolean wasActive = serverActive;
         FormulaNativeValues.resetConfig(false);
         FormulaRuntimeHooks.clearParameterFailures();
         FormulaRuntimeDispatcher.clearServer();
         SpellFormulaState.publishServer(SpellFormulaFiles.snapshot(Map.of(), List.of()));
         serverActive = false;
+        FormulaSpellConfig.reset(false);
         applyActiveFields();
         if (wasActive && !clientActive) resetNativeConfig();
         SpellRegistry.onConfigReload();
@@ -147,13 +198,99 @@ public final class SpellFormulaRuntime {
         FormulaRuntimeDispatcher.clearClient();
         SpellFormulaState.publishClient(SpellFormulaFiles.snapshot(Map.of(), List.of()));
         clientActive = false;
+        FormulaSpellConfig.reset(true);
         if (!serverActive) applyActiveFields();
         if (wasActive && !serverActive) resetNativeConfig();
         SpellRegistry.onConfigReload();
     }
 
     private static void resetNativeConfig() {
-        SpellConfigManager.getInstance().handleClientSync(new SyncJsonConfigPacket(Map.of()));
+        FormulaSpellConfig.resetNative();
+    }
+
+    private static void commit(Prepared prepared, boolean clientSide, Set<String> disabled) {
+        CommitState previous = checkpoint(prepared, clientSide);
+        try {
+            if (clientSide) {
+                FormulaRuntimeDispatcher.replaceClient(prepared.invokers(), disabled);
+                SpellFormulaState.publishClient(prepared.snapshot());
+                clientActive = true;
+                if (!serverActive) applyActiveFields();
+            } else {
+                FormulaRuntimeDispatcher.replaceServer(prepared.invokers());
+                SpellFormulaState.publishServer(prepared.snapshot());
+                serverActive = true;
+                applyActiveFields();
+            }
+            FormulaSpellConfig.apply(prepared.snapshot(), clientSide);
+            SpellRegistry.onConfigReload();
+        } catch (RuntimeException | LinkageError failure) {
+            rollback(previous, clientSide, failure);
+            throw failure;
+        }
+        FormulaRuntimeHooks.clearParameterFailures();
+    }
+
+    private static CommitState checkpoint(Prepared prepared, boolean clientSide) {
+        List<SavedField> fields = new ArrayList<>();
+        Set<ChangedField> affected = new LinkedHashSet<>();
+        if (!clientSide || !serverActive) {
+            affected.addAll(MODIFIED);
+            for (var override : prepared.snapshot().byClass().values()) {
+                AbstractSpell spell = registeredSpell(override.spell());
+                for (String name : override.parameters().keySet())
+                    if (BASE_FIELDS.contains(name) && !name.equals("baseSpellPower") && !name.equals("spellPowerPerLevel"))
+                        affected.add(new ChangedField(spell, name));
+            }
+        }
+        try {
+            for (ChangedField changed : affected) {
+                Field field = FIELDS.get(changed.field());
+                fields.add(new SavedField(changed.spell(), field, field.getInt(changed.spell())));
+            }
+        } catch (IllegalAccessException failure) { throw new IllegalStateException("Cannot checkpoint spell parameters", failure); }
+        return new CommitState(SpellFormulaState.serverSnapshot(), SpellFormulaState.clientSnapshot(), serverActive, clientActive,
+                FormulaRuntimeDispatcher.checkpoint(), FormulaNativeValues.configCheckpoint(), List.copyOf(fields),
+                new LinkedHashSet<>(MODIFIED));
+    }
+
+    private static void rollback(CommitState previous, boolean clientSide, Throwable failure) {
+        restoreOwned(previous, failure);
+        try {
+            boolean active = clientSide ? previous.clientActive() : previous.serverActive();
+            var snapshot = clientSide ? previous.client() : previous.server();
+            if (active) FormulaSpellConfig.apply(snapshot, clientSide);
+            else {
+                FormulaSpellConfig.reset(clientSide);
+                if (!clientSide) {
+                    FormulaSpellConfig.apply(snapshot, false);
+                    FormulaSpellConfig.reset(false);
+                }
+            }
+            SpellRegistry.onConfigReload();
+        } catch (RuntimeException | LinkageError rollbackFailure) {
+            if (rollbackFailure != failure) failure.addSuppressed(rollbackFailure);
+        } finally {
+            restoreOwned(previous, failure);
+        }
+        SpellCompiler.LOGGER.error("[SpellFormula] 提交失败，已尝试恢复此前的本模组状态及原版后端", failure);
+    }
+
+    private static void restoreOwned(CommitState previous, Throwable failure) {
+        SpellFormulaState.publishServer(previous.server());
+        SpellFormulaState.publishClient(previous.client());
+        serverActive = previous.serverActive();
+        clientActive = previous.clientActive();
+        FormulaRuntimeDispatcher.restore(previous.bindings());
+        FormulaNativeValues.restoreConfig(previous.nativeConfig());
+        for (SavedField saved : previous.fields()) {
+            try { saved.field().setInt(saved.spell(), saved.value()); }
+            catch (IllegalAccessException | RuntimeException restoreFailure) {
+                if (restoreFailure != failure) failure.addSuppressed(restoreFailure);
+            }
+        }
+        MODIFIED.clear();
+        MODIFIED.addAll(previous.modified());
     }
 
     private static Prepared prepare(SpellFormulaFiles.Snapshot requested) {
@@ -166,10 +303,16 @@ public final class SpellFormulaRuntime {
             try {
                 AbstractSpell spell = registeredSpell(override.spell());
                 JsonElement school = override.advanced().get("school");
-                if (school != null && SchoolRegistry.REGISTRY.get().getValue(ResourceLocation.parse(school.getAsString())) == null)
+                if (school != null && SchoolRegistry.REGISTRY.get().getValue(new ResourceLocation(school.getAsString())) == null)
                     throw new IllegalArgumentException("配置学派尚未注册：" + school.getAsString());
                 FormulaParameterLimits.validate(override.spell(), override.advanced(), override.parameters());
-                var compiled = FormulaDelegateFactory.compileSpell(spell.getClass(), override.spell(), override.formulas(), true);
+                for (var attribute : override.attributes().values())
+                    if (!net.minecraft.core.registries.BuiltInRegistries.ATTRIBUTE.containsKey(new ResourceLocation(attribute.targetAttribute())))
+                        throw new IllegalArgumentException("目标属性尚未注册：" + attribute.targetAttribute());
+                var forced = override.spell().attributeComponents().stream()
+                        .filter(component -> override.attributes().containsKey(component.key()))
+                        .map(FormulaAttributes.Component::binding).collect(java.util.stream.Collectors.toSet());
+                var compiled = FormulaDelegateFactory.compileSpell(spell.getClass(), override.spell(), override.formulas(), true, forced);
                 compiled.forEach((method, invoker) -> invokers.put(FormulaRuntimeDispatcher.key(entry.getKey(), method), invoker));
                 accepted.put(entry.getKey(), override);
             } catch (RuntimeException | LinkageError failure) {
@@ -181,7 +324,7 @@ public final class SpellFormulaRuntime {
     }
 
     private static AbstractSpell registeredSpell(SpellFormulaCatalog.Spell definition) {
-        AbstractSpell spell = SpellRegistry.REGISTRY.get().getValue(ResourceLocation.parse(definition.id()));
+        AbstractSpell spell = SpellRegistry.REGISTRY.get().getValue(new ResourceLocation(definition.id()));
         if (spell == null || !spell.getClass().getName().equals(definition.className()))
             throw new IllegalStateException("法术目录与实际注册法术不符：" + definition.id());
         return spell;
@@ -231,9 +374,9 @@ public final class SpellFormulaRuntime {
         }
     }
 
-    private static void validateSnapshot(SpellFormulaFiles.Snapshot snapshot) {
+    private static void validateSnapshot(Prepared prepared) {
         try {
-            SpellFormulaNetwork.validateSnapshot(snapshot);
+            SpellFormulaNetwork.validateSnapshot(prepared.snapshot(), prepared.invokers().keySet());
         } catch (RuntimeException | LinkageError failure) {
             SpellCompiler.LOGGER.error("[SpellFormula] 新法术配置无法同步，已保留上一次完整配置", failure);
             throw failure;
@@ -252,32 +395,4 @@ public final class SpellFormulaRuntime {
         SpellCompiler.LOGGER.info("[SpellFormula] 已应用 {} 个法术的数据包变更。", snapshot.byClass().size());
     }
 
-    private static void modifyConfig(ModifyDefaultConfigValuesEvent event) {
-        SpellConfigHolder holder = ((ModifySpellConfigAccessor) event).getSpellCompilerConfig();
-        FormulaNativeValues.captureConfig(event.getSpell(), holder);
-        if (!EffectiveSide.get().isServer()) return;
-        var override = SpellFormulaState.serverSnapshot().byClass().get(event.getSpell().getClass().getName());
-        if (override == null) return;
-        override.advanced().forEach((name, value) -> set(holder, name, value));
-        override.parameters().forEach((name, value) -> {
-            if (!BASE_FIELDS.contains(name)) set(holder, name, value);
-        });
-        if (!override.advanced().isEmpty()) {
-            event.getSpell().resetRarityWeights();
-        }
-    }
-
-    private static void set(SpellConfigHolder holder, String name, JsonElement value) {
-        switch (name) {
-            case "enabled" -> holder.set(SpellConfigParameter.ENABLED, value.getAsBoolean());
-            case "max_level" -> holder.set(SpellConfigParameter.MAX_LEVEL, value.getAsInt());
-            case "min_rarity" -> holder.set(SpellConfigParameter.MIN_RARITY, SpellRarity.valueOf(value.getAsString().toUpperCase(Locale.ROOT)));
-            case "allow_crafting" -> holder.set(SpellConfigParameter.ALLOW_CRAFTING, value.getAsBoolean());
-            case "school" -> holder.set(SpellConfigParameter.SCHOOL, SchoolRegistry.REGISTRY.get().getValue(ResourceLocation.parse(value.getAsString())));
-            case "cooldown_in_seconds" -> holder.set(SpellConfigParameter.COOLDOWN_IN_SECONDS, value.getAsDouble());
-            case "power_multiplier" -> holder.set(SpellConfigParameter.POWER_MULTIPLIER, value.getAsDouble());
-            case "mana_cost_multiplier" -> holder.set(SpellConfigParameter.MANA_MULTIPLIER, value.getAsDouble());
-            default -> throw new IllegalArgumentException("不支持的原生法术配置：" + name);
-        }
-    }
 }

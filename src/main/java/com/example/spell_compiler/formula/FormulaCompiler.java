@@ -10,6 +10,7 @@ import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.MethodInsnNode;
@@ -58,7 +59,21 @@ public final class FormulaCompiler {
         Map<String, AutomaticFormulaExtractor.Variable> variables = new LinkedHashMap<>();
         variableTypes.forEach((name, type) -> variables.put(name,
                 new AutomaticFormulaExtractor.Variable(name, type, List.of())));
-        return new Parser(expression, variables, new IdentityHashMap<>(), Map.of(), widePower).parse().type();
+        return new Parser(expression, variables, Map.of(), widePower).parse().type();
+    }
+
+    static MethodNode compileExpressionMethod(String name, String descriptor, String expression,
+                                             Map<String, AutomaticFormulaExtractor.Variable> variables) {
+        Type result = Type.getReturnType(descriptor);
+        Expression parsed = new Parser(expression, variables, Map.of(), false).parse();
+        MethodNode method = new MethodNode(Opcodes.ASM9, Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                name, descriptor, null, null);
+        parsed.emit().accept(method.instructions);
+        convert(method.instructions, parsed.type(), result);
+        guardRuntimeValues(method.instructions, result);
+        method.instructions.add(new InsnNode(result.getOpcode(Opcodes.IRETURN)));
+        method.maxLocals = java.util.Arrays.stream(Type.getArgumentTypes(descriptor)).mapToInt(Type::getSize).sum();
+        return method;
     }
 
     public static byte[] compileForVerification(byte[] original, Map<String, String> overrides,
@@ -108,14 +123,14 @@ public final class FormulaCompiler {
             boolean widened = runtime && widePower && FormulaWidePower.applies(analysis.formula().variables());
             var variables = widened ? FormulaWidePower.variables(method, repository, analysis.formula().variables())
                     : analysis.formula().variables();
-            variables.values().forEach(variable -> collectLabels(variable.instructions(), labels));
+            if (widened) variables.values().forEach(variable -> collectLabels(variable.instructions(), labels));
             Expression expression;
             String resolved;
             try {
                 Map<String, Type> variableTypes = new LinkedHashMap<>();
                 analysis.formula().variables().forEach((name, variable) -> variableTypes.put(name, variable.type()));
                 resolved = ReadableFormula.resolve(analysis.formula().expression(), overrides.get(key), variableTypes).expression();
-                Parser parser = new Parser(resolved, variables, labels, analysis.formula().nativePowers(), widePower);
+                Parser parser = new Parser(resolved, variables, analysis.formula().nativePowers(), widePower);
                 expression = parser.parse();
             } catch (IllegalArgumentException failure) {
                 throw new IllegalArgumentException(owner.name + '#' + key + ": " + failure.getMessage(), failure);
@@ -181,6 +196,12 @@ public final class FormulaCompiler {
     private static void cloneInto(List<AbstractInsnNode> instructions, InsnList destination,
                                   Map<LabelNode, LabelNode> labels) {
         for (AbstractInsnNode instruction : instructions) destination.add(instruction.clone(labels));
+    }
+
+    private static void cloneInto(List<AbstractInsnNode> instructions, InsnList destination) {
+        var labels = new IdentityHashMap<LabelNode, LabelNode>();
+        collectLabels(instructions, labels);
+        cloneInto(instructions, destination, labels);
     }
 
     private record Expression(Type type, Consumer<InsnList> emit) {}
@@ -281,18 +302,16 @@ public final class FormulaCompiler {
     private static final class Parser {
         private final String source;
         private final Map<String, AutomaticFormulaExtractor.Variable> variables;
-        private final Map<LabelNode, LabelNode> labels;
         private final Map<String, AutomaticFormulaExtractor.NativePower> nativePowers;
         private final boolean wideNumbers;
         private int position;
 
         private Parser(String source, Map<String, AutomaticFormulaExtractor.Variable> variables,
-                       Map<LabelNode, LabelNode> labels, Map<String, AutomaticFormulaExtractor.NativePower> nativePowers,
+                       Map<String, AutomaticFormulaExtractor.NativePower> nativePowers,
                        boolean wideNumbers) {
             FormulaSyntaxGuard.validate(source);
             this.source = source;
             this.variables = variables;
-            this.labels = labels;
             this.nativePowers = nativePowers;
             this.wideNumbers = wideNumbers;
         }
@@ -383,7 +402,7 @@ public final class FormulaCompiler {
                 if (variable.localSlot() >= 0) {
                     instructions.add(new VarInsnNode(variable.type().getOpcode(Opcodes.ILOAD), variable.localSlot()));
                 } else {
-                    cloneInto(variable.instructions(), instructions, labels);
+                    cloneInto(variable.instructions(), instructions);
                 }
             });
         }
@@ -396,8 +415,8 @@ public final class FormulaCompiler {
                 return new Expression(Type.FLOAT_TYPE, instructions -> {
                     input.emit().accept(instructions);
                     convert(instructions, input.type(), Type.FLOAT_TYPE);
-                    cloneInto(nativePower.receiver(), instructions, labels);
-                    cloneInto(nativePower.caster(), instructions, labels);
+                    cloneInto(nativePower.receiver(), instructions);
+                    cloneInto(nativePower.caster(), instructions);
                     instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                             "com/example/spell_compiler/formula/FormulaRuntimeHooks",
                             nativePower.source() == AutomaticFormulaExtractor.PowerSource.SPELL_POWER
@@ -406,13 +425,16 @@ public final class FormulaCompiler {
                 });
             }
             int arity = switch (name) {
-                case "min", "max" -> 2;
-                case "clamp" -> 3;
+                case "min", "max", "eq", "ne", "lt", "le", "gt", "ge" -> 2;
+                case "clamp", "if" -> 3;
                 case "int", "long", "float", "double", "sqrt", "abs", "floor", "ceil", "round",
                         "mth_floor", "mth_ceil", "softcap" -> 1;
                 default -> throw error("Unsupported function: " + name);
             };
             if (arguments.size() != arity) throw error(name + " expects " + arity + " arguments, got " + arguments.size());
+            if (name.equals("if")) return conditional(arguments);
+            if (java.util.Set.of("eq", "ne", "lt", "le", "gt", "ge").contains(name))
+                return comparison(name, arguments.get(0), arguments.get(1));
             Type common = arguments.get(0).type();
             for (int index = 1; index < arguments.size(); index++) common = promote(common, arguments.get(index).type());
             Type target = switch (name) {
@@ -455,6 +477,74 @@ public final class FormulaCompiler {
                     convert(instructions, argument.type(), inputType);
                 }
                 instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, owner, methodName, descriptor, false));
+            });
+        }
+
+        private Expression conditional(List<Expression> arguments) {
+            Expression condition = arguments.get(0);
+            Expression yes = arguments.get(1);
+            Expression no = arguments.get(2);
+            Type type = promote(yes.type(), no.type());
+            return new Expression(type, instructions -> {
+                LabelNode otherwise = new LabelNode();
+                LabelNode end = new LabelNode();
+                condition.emit().accept(instructions);
+                if (!condition.type().equals(Type.INT_TYPE)) {
+                    if (condition.type().equals(Type.LONG_TYPE)) {
+                        instructions.add(new InsnNode(Opcodes.LCONST_0));
+                        instructions.add(new InsnNode(Opcodes.LCMP));
+                    } else if (condition.type().equals(Type.FLOAT_TYPE)) {
+                        instructions.add(new InsnNode(Opcodes.FCONST_0));
+                        instructions.add(new InsnNode(Opcodes.FCMPG));
+                    } else {
+                        instructions.add(new InsnNode(Opcodes.DCONST_0));
+                        instructions.add(new InsnNode(Opcodes.DCMPG));
+                    }
+                }
+                instructions.add(new JumpInsnNode(Opcodes.IFEQ, otherwise));
+                yes.emit().accept(instructions);
+                convert(instructions, yes.type(), type);
+                instructions.add(new JumpInsnNode(Opcodes.GOTO, end));
+                instructions.add(otherwise);
+                no.emit().accept(instructions);
+                convert(instructions, no.type(), type);
+                instructions.add(end);
+            });
+        }
+
+        private Expression comparison(String name, Expression left, Expression right) {
+            Type type = promote(left.type(), right.type());
+            int branch = switch (name) {
+                case "eq" -> Opcodes.IFEQ;
+                case "ne" -> Opcodes.IFNE;
+                case "lt" -> Opcodes.IFLT;
+                case "le" -> Opcodes.IFLE;
+                case "gt" -> Opcodes.IFGT;
+                case "ge" -> Opcodes.IFGE;
+                default -> throw error("Unsupported comparison: " + name);
+            };
+            return new Expression(Type.INT_TYPE, instructions -> {
+                LabelNode yes = new LabelNode();
+                LabelNode end = new LabelNode();
+                left.emit().accept(instructions);
+                convert(instructions, left.type(), type);
+                right.emit().accept(instructions);
+                convert(instructions, right.type(), type);
+                if (type.equals(Type.INT_TYPE)) {
+                    instructions.add(new JumpInsnNode(branch + Opcodes.IF_ICMPEQ - Opcodes.IFEQ, yes));
+                } else {
+                    boolean lowNaN = name.equals("gt") || name.equals("ge");
+                    int compare = type.equals(Type.LONG_TYPE) ? Opcodes.LCMP
+                            : type.equals(Type.FLOAT_TYPE) ? lowNaN ? Opcodes.FCMPL : Opcodes.FCMPG
+                            : lowNaN ? Opcodes.DCMPL : Opcodes.DCMPG;
+                    instructions.add(new InsnNode(compare));
+                    instructions.add(new JumpInsnNode(branch, yes));
+                }
+                instructions.add(new InsnNode(Opcodes.ICONST_0));
+                instructions.add(new JumpInsnNode(Opcodes.GOTO, end));
+                instructions.add(yes);
+                instructions.add(new InsnNode(Opcodes.ICONST_1));
+                instructions.add(end);
             });
         }
 

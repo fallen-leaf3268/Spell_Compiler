@@ -8,7 +8,9 @@ import org.apache.logging.log4j.Logger;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 
 public final class FormulaRuntimeDispatcher {
     @FunctionalInterface
@@ -19,6 +21,7 @@ public final class FormulaRuntimeDispatcher {
     private static final Logger LOGGER = LogManager.getLogger(FormulaRuntimeDispatcher.class);
     private static volatile Map<String, Invoker> server = Map.of();
     private static volatile Map<String, Invoker> client = Map.of();
+    private static volatile BiConsumer<String, Invoker> serverFailure = (key, invoker) -> {};
 
     private FormulaRuntimeDispatcher() {}
 
@@ -26,15 +29,54 @@ public final class FormulaRuntimeDispatcher {
         return owner.replace('/', '.') + '#' + methodKey;
     }
 
-    public static void replaceServer(Map<String, Invoker> overrides) { server = guarded(overrides); }
+    public static void replaceServer(Map<String, Invoker> overrides) { server = guarded(overrides, true, Set.of()); }
 
-    public static void replaceClient(Map<String, Invoker> overrides) { client = guarded(overrides); }
+    public static void replaceClient(Map<String, Invoker> overrides) { replaceClient(overrides, Set.of()); }
+
+    static void replaceClient(Map<String, Invoker> overrides, Set<String> disabled) {
+        if (!overrides.keySet().containsAll(disabled)) throw new IllegalArgumentException("Unknown disabled formula");
+        client = guarded(overrides, false, disabled);
+    }
+
+    public static Set<String> disabledServerKeys() {
+        return server.entrySet().stream().filter(entry -> entry.getValue() instanceof GuardedInvoker guarded && guarded.disabled.get())
+                .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
+    static void onServerFailure(BiConsumer<String, Invoker> listener) { serverFailure = Objects.requireNonNull(listener); }
+
+    static boolean isCurrentServerInvoker(String key, Invoker invoker) { return server.get(key) == invoker; }
+
+    static Object serverBindingsIdentity() { return server; }
+
+    record Installed(Map<String, Invoker> server, Map<String, Invoker> client) {}
+
+    static Installed checkpoint() { return new Installed(server, client); }
+
+    static void restore(Installed previous) {
+        server = previous.server();
+        client = previous.client();
+    }
+
+    static void disableClient(String key) {
+        if (!(client.get(key) instanceof GuardedInvoker invoker)) throw new IllegalArgumentException("Unknown disabled formula: " + key);
+        invoker.disabled.set(true);
+    }
 
     public static void clearServer() { server = Map.of(); }
 
     public static void clearClient() { client = Map.of(); }
 
     public static boolean hasOverride(String key, Object actor) { return resolve(key, actor) != null; }
+
+    public static boolean isActive(String key, Object actor) {
+        return resolveActive(key, actor) != null;
+    }
+
+    public static Invoker resolveActive(String key, Object actor) {
+        Invoker invoker = resolve(key, actor);
+        return invoker instanceof GuardedInvoker guarded && guarded.disabled.get() ? null : invoker;
+    }
 
     public static Invoker resolve(String key, Object actor) {
         if (FormulaNativeValues.isEvaluatingOriginal()) return null;
@@ -58,34 +100,45 @@ public final class FormulaRuntimeDispatcher {
         }
     }
 
-    private static Map<String, Invoker> guarded(Map<String, Invoker> overrides) {
+    private static Map<String, Invoker> guarded(Map<String, Invoker> overrides, boolean serverSide, Set<String> disabled) {
         Map<String, Invoker> result = new LinkedHashMap<>();
-        overrides.forEach((key, invoker) -> result.put(key, new GuardedInvoker(key, invoker)));
+        overrides.forEach((key, invoker) -> result.put(key, new GuardedInvoker(key, invoker, serverSide, disabled.contains(key))));
         return Map.copyOf(result);
     }
 
     private static final class GuardedInvoker implements Invoker {
         private final String key;
+        private final String methodKey;
         private final Invoker delegate;
         private final AtomicBoolean disabled = new AtomicBoolean();
+        private final AtomicBoolean reported = new AtomicBoolean();
+        private final boolean serverSide;
 
-        private GuardedInvoker(String key, Invoker delegate) {
+        private GuardedInvoker(String key, Invoker delegate, boolean serverSide, boolean disabled) {
             this.key = key;
+            int separator = key.indexOf('#');
+            this.methodKey = separator < 0 ? key : key.substring(separator + 1);
             this.delegate = Objects.requireNonNull(delegate);
+            this.serverSide = serverSide;
+            this.disabled.set(disabled);
         }
 
         @Override
         public Number invoke(Object self, Object[] arguments) throws Throwable {
             if (disabled.get()) return null;
             try {
-                Number value = Objects.requireNonNull(FormulaNativeValues.invokeConfigured(self, key, arguments, delegate),
+                Number value = Objects.requireNonNull(FormulaNativeValues.invokeConfigured(self, methodKey, arguments, delegate),
                         "法术公式返回了空数值");
                 if (!Double.isFinite(value.doubleValue()))
                     throw new ArithmeticException("法术公式返回了非有限数值：" + value);
                 return value;
             } catch (RuntimeException | LinkageError failure) {
-                if (disabled.compareAndSet(false, true))
+                if (serverSide && disabled.compareAndSet(false, true)) {
                     LOGGER.error("[SpellFormula] {} 执行失败，本次加载期间回退到原生公式", key, failure);
+                    if (isCurrentServerInvoker(key, this)) serverFailure.accept(key, this);
+                } else if (!serverSide && reported.compareAndSet(false, true)) {
+                    LOGGER.error("[SpellFormula] {} 客户端本次求值失败，使用原生结果；服务端状态未改变", key, failure);
+                }
                 return null;
             }
         }

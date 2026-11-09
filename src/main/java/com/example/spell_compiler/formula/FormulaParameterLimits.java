@@ -3,7 +3,6 @@ package com.example.spell_compiler.formula;
 import com.google.gson.JsonElement;
 
 import java.util.Map;
-import java.util.Set;
 
 final class FormulaParameterLimits {
     private FormulaParameterLimits() {}
@@ -39,7 +38,9 @@ final class FormulaParameterLimits {
     }
 
     static boolean related(Map<String, JsonElement> parameters, boolean levelChanged, String... names) {
-        return levelChanged || parameters.keySet().stream().anyMatch(Set.of(names)::contains);
+        if (levelChanged) return true;
+        for (String name : names) if (parameters.containsKey(name)) return true;
+        return false;
     }
 
     static int linear(int base, int step, int level) {

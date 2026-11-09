@@ -6,8 +6,11 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 public final class ReadableFormula {
+    private static final Pattern NATIVE_POWER_MARKER = Pattern.compile("__native_power_[0-9]+");
+
     public enum Strategy { SOURCE_MAPPED, NATURAL_DSL }
 
     public record Resolution(String expression, Strategy strategy) {}
@@ -165,6 +168,9 @@ public final class ReadableFormula {
         if (call.name().equals("sqrt") || call.name().equals("floor") || call.name().equals("ceil")
                 || call.name().equals("softcap")) return Type.DOUBLE_TYPE;
         if (call.name().equals("mth_floor") || call.name().equals("mth_ceil")) return Type.INT_TYPE;
+        if (java.util.Set.of("eq", "ne", "lt", "le", "gt", "ge").contains(call.name())) return Type.INT_TYPE;
+        if (call.name().equals("if")) return promotedType(expressionType(call.arguments().get(1), types),
+                expressionType(call.arguments().get(2), types));
         Type common = expressionType(call.arguments().get(0), types);
         for (int index = 1; index < call.arguments().size(); index++)
             common = promotedType(common, expressionType(call.arguments().get(index), types));
@@ -181,7 +187,7 @@ public final class ReadableFormula {
     }
 
     private static boolean nativePowerMarker(String name) {
-        return name.matches("__native_power_[0-9]+");
+        return NATIVE_POWER_MARKER.matcher(name).matches();
     }
 
     private static Node stripNativePower(Node source) {
@@ -267,7 +273,6 @@ public final class ReadableFormula {
             collectAtoms(binary.left(), atoms);
             collectAtoms(binary.right(), atoms);
         } else if (node instanceof Unary unary) collectAtoms(unary.input(), atoms);
-        else if (node instanceof Call call) call.arguments().forEach(argument -> collectAtoms(argument, atoms));
     }
 
     private static boolean sameGrouping(Node first, Node second) {
@@ -276,12 +281,6 @@ public final class ReadableFormula {
             return a.operator().equals(b.operator()) && sameGrouping(a.left(), b.left()) && sameGrouping(a.right(), b.right());
         if (first instanceof Unary a && second instanceof Unary b)
             return a.operator().equals(b.operator()) && sameGrouping(a.input(), b.input());
-        if (first instanceof Call a && second instanceof Call b) {
-            if (!a.name().equals(b.name()) || a.arguments().size() != b.arguments().size()) return false;
-            for (int index = 0; index < a.arguments().size(); index++)
-                if (!sameGrouping(a.arguments().get(index), b.arguments().get(index))) return false;
-            return true;
-        }
         return false;
     }
 
@@ -355,6 +354,7 @@ public final class ReadableFormula {
     }
 
     private static String readable(Node node, int parent, boolean right, String parentOperator) {
+        int own = precedence(node);
         String text;
         if (node instanceof Literal literal) text = literal.token();
         else if (node instanceof Variable variable) text = variable.name();
@@ -365,11 +365,9 @@ public final class ReadableFormula {
                     .map(argument -> readable(argument, 0, false, null)).toList()) + ')';
         else {
             Binary binary = (Binary) node;
-            int own = precedence(node);
             text = readable(binary.left(), own, false, binary.operator()) + ' ' + binary.operator() + ' '
                     + readable(binary.right(), own, true, binary.operator());
         }
-        int own = precedence(node);
         boolean matchingAssociative = node instanceof Binary binary
                 && binary.operator().equals(parentOperator) && (parentOperator.equals("+") || parentOperator.equals("*"));
         boolean parentheses = own < parent || (right && own == parent && node instanceof Binary && !matchingAssociative);
@@ -470,7 +468,7 @@ public final class ReadableFormula {
             return child == null ? null : new Unary(a.operator(), child);
         }
         if (source instanceof Binary a && edited instanceof Binary b && a.operator().equals(b.operator())) {
-            Node offset = rewriteProjectedOffset(a, b, types);
+            Node offset = rewriteProjectedOffset(a, b, projected, types);
             if (offset != null) return offset;
             if (!sameGrouping(projected, edited)) return null;
             List<Node> desired = new ArrayList<>();
@@ -492,14 +490,14 @@ public final class ReadableFormula {
         return null;
     }
 
-    private static Node rewriteProjectedOffset(Binary source, Binary edited, Map<String, Type> types) {
+    private static Node rewriteProjectedOffset(Binary source, Binary edited, Node projected, Map<String, Type> types) {
         if (!source.operator().equals("+") && !source.operator().equals("-")) return null;
         boolean leftGrowth = source.left() instanceof Call call && call.hiddenProjection() && call.name().equals("int")
                 && integerOffset(source.right());
         boolean rightGrowth = source.right() instanceof Call call && call.hiddenProjection() && call.name().equals("int")
                 && integerOffset(source.left());
         if (!leftGrowth && !rightGrowth) return null;
-        if (containsEquivalent(visible(source), edited)) return null;
+        if (containsEquivalent(projected, edited)) return null;
         if (leftGrowth && containsVariable(edited.right()) || rightGrowth && containsVariable(edited.left())) return null;
         Node left = rewrite(source.left(), edited.left(), types, null);
         Node right = rewrite(source.right(), edited.right(), types, null);
@@ -534,25 +532,17 @@ public final class ReadableFormula {
             Node right = rebuildVisible(binary.right(), desired, cursor, types, null);
             return left == null || right == null ? null : new Binary(binary.operator(), left, right);
         }
-        if (source instanceof Unary unary) {
-            Node child = rebuildVisible(unary.input(), desired, cursor, types, constantType);
-            return child == null ? null : new Unary(unary.operator(), child);
-        }
-        Call call = (Call) source;
-        List<Node> arguments = new ArrayList<>();
-        for (Node argument : call.arguments()) {
-            Node child = rebuildVisible(argument, desired, cursor, types, null);
-            if (child == null) return null;
-            arguments.add(child);
-        }
-        return new Call(call.name(), arguments, call.hiddenProjection());
+        Unary unary = (Unary) source;
+        Node child = rebuildVisible(unary.input(), desired, cursor, types, constantType);
+        return child == null ? null : new Unary(unary.operator(), child);
     }
 
     private static Restored restoreWhole(Node source, Node edited, Map<String, Type> types) {
-        if (containsVariable(source) && !containsVariable(edited)) return new Restored(edited, false);
+        boolean sourceHasVariables = containsVariable(source);
+        if (sourceHasVariables && !containsVariable(edited)) return new Restored(edited, false);
         if (equivalent(visible(source), edited) || equivalent(stripNativePower(source), edited))
             return new Restored(source, true);
-        if (containsVariable(source)) {
+        if (sourceHasVariables) {
             Node mapped = rewrite(source, edited, types, null);
             if (mapped != null) return new Restored(mapped, true);
         }
@@ -783,8 +773,8 @@ public final class ReadableFormula {
                 require(')');
             }
             int expected = switch (name) {
-                case "min", "max" -> 2;
-                case "clamp" -> 3;
+                case "min", "max", "eq", "ne", "lt", "le", "gt", "ge" -> 2;
+                case "clamp", "if" -> 3;
                 case "int", "long", "float", "double", "sqrt", "abs", "floor", "ceil", "round", "mth_floor", "mth_ceil", "softcap" -> 1;
                 default -> {
                     if (!nativePowerMarker(name)) throw error("Unknown function " + name);

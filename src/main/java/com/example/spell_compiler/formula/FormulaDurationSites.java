@@ -11,11 +11,6 @@ import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
-import org.objectweb.asm.tree.analysis.Analyzer;
-import org.objectweb.asm.tree.analysis.AnalyzerException;
-import org.objectweb.asm.tree.analysis.Frame;
-import org.objectweb.asm.tree.analysis.SourceInterpreter;
-import org.objectweb.asm.tree.analysis.SourceValue;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -51,6 +46,7 @@ public final class FormulaDurationSites {
         int floating = 0;
         int direct = 0;
         int previews = 0;
+        var repository = FormulaClassRepository.of(target);
         for (MethodNode method : target.methods) {
             if (durations.containsKey(method.name + method.desc)) {
                 Type result = Type.getReturnType(method.desc);
@@ -66,13 +62,13 @@ public final class FormulaDurationSites {
                     && !method.name.equals("getUniqueInfo")) continue;
             String durationMethod = durations.size() == 1 ? durations.keySet().iterator().next() : null;
             if (durationMethod != null && !durationMethod.endsWith(DURATION_ARGUMENTS + 'I')) durationMethod = null;
-            List<Site> sites = findSites(target.name, method, durationMethod);
+            List<Site> sites = findSites(repository, target.name, method, durationMethod);
             for (Site site : sites) {
                 inject(method, site);
                 if (site.preview()) previews++;
                 else direct++;
             }
-            protectAoeConsumers(target, method, durations);
+            protectAoeConsumers(repository, target, method, durations);
         }
         return new Coverage(integers, floating, direct, previews);
     }
@@ -94,7 +90,7 @@ public final class FormulaDurationSites {
         method.maxStack += 4;
     }
 
-    private static List<Site> findSites(String owner, MethodNode method, String durationMethod) {
+    private static List<Site> findSites(FormulaClassRepository repository, String owner, MethodNode method, String durationMethod) {
         boolean casts = method.name.equals("onCast") || method.name.startsWith("lambda$onCast$");
         List<MethodInsnNode> consumers = new ArrayList<>();
         for (AbstractInsnNode instruction : method.instructions) {
@@ -105,119 +101,117 @@ public final class FormulaDurationSites {
                     && call.name.equals("timeFromTicks") && call.desc.equals("(FI)Ljava/lang/String;")) consumers.add(call);
         }
         if (consumers.isEmpty()) return List.of();
-        try {
-            Frame<SourceValue>[] frames = new Analyzer<>(new SourceInterpreter()).analyze(owner, method);
-            List<Site> sites = new ArrayList<>();
-            for (MethodInsnNode consumer : consumers) {
-                Frame<SourceValue> frame = frames[method.instructions.indexOf(consumer)];
-                if (frame == null) continue;
-                int argument = frame.getStackSize() - Type.getArgumentTypes(consumer.desc).length + (casts ? 1 : 0);
-                Plan plan = plan(method, frames, source(frame.getStack(argument)), !casts);
-                if (plan != null) sites.add(new Site(plan, !casts, casts ? null : durationMethod));
-            }
-            return List.copyOf(sites);
-        } catch (AnalyzerException failure) {
-            throw new IllegalArgumentException("无法核对原生持续时间消费者：" + owner + '#' + method.name + method.desc, failure);
+        var flow = analyze(repository, owner, method, "原生持续时间消费者");
+        List<Site> sites = new ArrayList<>();
+        for (MethodInsnNode consumer : consumers) {
+            if (!flow.reachable(consumer)) continue;
+            var arguments = flow.arguments(consumer);
+            int argument = casts ? 1 : 0;
+            if (arguments.size() <= argument) continue;
+            Plan plan = plan(flow, source(arguments.get(argument)), !casts);
+            if (plan != null) sites.add(new Site(plan, !casts, casts ? null : durationMethod));
         }
+        return List.copyOf(sites);
     }
 
-    private static void protectAoeConsumers(ClassNode owner, MethodNode method,
+    private static void protectAoeConsumers(FormulaClassRepository repository, ClassNode owner, MethodNode method,
                                              Map<String, SpellFormulaCatalog.Method> durations) {
         if (!method.name.equals("onCast") || durations.isEmpty()) return;
-        var repository = FormulaClassRepository.of(owner);
         List<MethodInsnNode> consumers = new ArrayList<>();
         for (var instruction : method.instructions)
             if (instruction instanceof MethodInsnNode call && call.name.equals("setDuration") && call.desc.equals("(I)V")
                     && repository.isSubtype(call.owner, "io/redspace/ironsspellbooks/entity/spells/AoeEntity")) consumers.add(call);
         if (consumers.isEmpty()) return;
-        try {
-            Frame<SourceValue>[] frames = new Analyzer<>(new SourceInterpreter()).analyze(owner.name, method);
-            List<AoeSite> selected = new ArrayList<>();
-            for (var consumer : consumers) {
-                var produced = operand(method, frames, consumer, 0);
-                if (!(produced instanceof MethodInsnNode getter) || getter.getOpcode() != Opcodes.INVOKEVIRTUAL
-                        || !getter.owner.equals(owner.name) || !durations.containsKey(getter.name + getter.desc)
-                        || !getter.desc.equals(DURATION_ARGUMENTS + 'I')) continue;
-                var receiver = operand(method, frames, getter, 2);
-                var level = operand(method, frames, getter, 1);
-                var caster = operand(method, frames, getter, 0);
-                if (!(receiver instanceof VarInsnNode self) || self.getOpcode() != Opcodes.ALOAD || self.var != 0
-                        || !(level instanceof VarInsnNode integer) || integer.getOpcode() != Opcodes.ILOAD
-                        || !(caster instanceof VarInsnNode actor) || actor.getOpcode() != Opcodes.ALOAD) continue;
-                selected.add(new AoeSite(consumer, getter.name + getter.desc, integer.var, actor.var));
-            }
-            for (var site : selected) {
-                int durationSlot = method.maxLocals++;
-                InsnList code = new InsnList();
-                code.add(new VarInsnNode(Opcodes.ISTORE, durationSlot));
-                code.add(new InsnNode(Opcodes.DUP));
-                code.add(new VarInsnNode(Opcodes.ILOAD, durationSlot));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new LdcInsnNode(site.method()));
-                code.add(new VarInsnNode(Opcodes.ILOAD, site.levelSlot()));
-                code.add(new VarInsnNode(Opcodes.ALOAD, site.casterSlot()));
-                code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SAFETY, "guardAoeDuration",
-                        "(Ljava/lang/Object;ILjava/lang/Object;Ljava/lang/String;ILjava/lang/Object;)I", false));
-                method.instructions.insertBefore(site.consumer(), code);
-                method.maxStack += 5;
-            }
-        } catch (AnalyzerException failure) {
-            throw new IllegalArgumentException("无法核对原生范围实体持续时间：" + owner.name + '#' + method.name + method.desc, failure);
+        var flow = analyze(repository, owner.name, method, "原生范围实体持续时间");
+        List<AoeSite> selected = new ArrayList<>();
+        for (var consumer : consumers) {
+            var produced = operand(flow, consumer, 0);
+            if (!(produced instanceof MethodInsnNode getter) || getter.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !getter.owner.equals(owner.name) || !durations.containsKey(getter.name + getter.desc)
+                    || !getter.desc.equals(DURATION_ARGUMENTS + 'I')) continue;
+            var receiver = operand(flow, getter, 2);
+            var level = operand(flow, getter, 1);
+            var caster = operand(flow, getter, 0);
+            if (!(receiver instanceof VarInsnNode self) || self.getOpcode() != Opcodes.ALOAD || self.var != 0
+                    || !(level instanceof VarInsnNode integer) || integer.getOpcode() != Opcodes.ILOAD
+                    || !(caster instanceof VarInsnNode actor) || actor.getOpcode() != Opcodes.ALOAD) continue;
+            selected.add(new AoeSite(consumer, getter.name + getter.desc, integer.var, actor.var));
+        }
+        for (var site : selected) {
+            int durationSlot = method.maxLocals++;
+            InsnList code = new InsnList();
+            code.add(new VarInsnNode(Opcodes.ISTORE, durationSlot));
+            code.add(new InsnNode(Opcodes.DUP));
+            code.add(new VarInsnNode(Opcodes.ILOAD, durationSlot));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new LdcInsnNode(site.method()));
+            code.add(new VarInsnNode(Opcodes.ILOAD, site.levelSlot()));
+            code.add(new VarInsnNode(Opcodes.ALOAD, site.casterSlot()));
+            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SAFETY, "guardAoeDuration",
+                    "(Ljava/lang/Object;ILjava/lang/Object;Ljava/lang/String;ILjava/lang/Object;)I", false));
+            method.instructions.insertBefore(site.consumer(), code);
+            method.maxStack += 5;
         }
     }
 
-    private static Plan plan(MethodNode method, Frame<SourceValue>[] frames, AbstractInsnNode root, boolean preview) {
+    private static FormulaDataFlow.Analysis analyze(FormulaClassRepository repository, String owner, MethodNode method, String purpose) {
+        var flow = FormulaDataFlow.analyze(repository, owner, method);
+        if (!flow.successful()) throw new IllegalArgumentException("无法核对" + purpose + "：" + owner + '#' + method.name + method.desc
+                + ": " + flow.diagnostics());
+        return flow;
+    }
+
+    private static Plan plan(FormulaDataFlow.Analysis flow, AbstractInsnNode root, boolean preview) {
         if (root == null) return null;
         if (preview) {
-            Power input = power(method, frames, root);
+            Power input = power(flow, root);
             if (input != null) return new Plan(root, input, 1, false);
-            return floatProduct(method, frames, root, root);
+            return floatProduct(flow, root, root);
         }
         if (root.getOpcode() == Opcodes.F2I) {
-            AbstractInsnNode input = operand(method, frames, root, 0);
-            Power power = power(method, frames, input);
+            AbstractInsnNode input = operand(flow, root, 0);
+            Power power = power(flow, input);
             if (power != null) return new Plan(root, power, 1, false);
-            return floatProduct(method, frames, input, root);
+            return floatProduct(flow, input, root);
         }
         if (root.getOpcode() == Opcodes.IMUL) {
-            AbstractInsnNode left = operand(method, frames, root, 1);
-            Number right = constant(operand(method, frames, root, 0));
+            AbstractInsnNode left = operand(flow, root, 1);
+            Number right = constant(operand(flow, root, 0));
             if (left == null || left.getOpcode() != Opcodes.F2I || !(right instanceof Integer)) return null;
-            Power power = power(method, frames, operand(method, frames, left, 0));
+            Power power = power(flow, operand(flow, left, 0));
             if (power != null) return new Plan(root, power, right.floatValue(), true);
         }
         return null;
     }
 
-    private static Plan floatProduct(MethodNode method, Frame<SourceValue>[] frames, AbstractInsnNode product,
+    private static Plan floatProduct(FormulaDataFlow.Analysis flow, AbstractInsnNode product,
                                      AbstractInsnNode root) {
         if (product == null || product.getOpcode() != Opcodes.FMUL) return null;
-        Power power = power(method, frames, operand(method, frames, product, 1));
-        Number scale = constant(operand(method, frames, product, 0));
+        Power power = power(flow, operand(flow, product, 1));
+        Number scale = constant(operand(flow, product, 0));
         if (power == null || !(scale instanceof Float)) return null;
         return new Plan(root, power, scale.floatValue(), false);
     }
 
-    private static Power power(MethodNode method, Frame<SourceValue>[] frames, AbstractInsnNode instruction) {
+    private static Power power(FormulaDataFlow.Analysis flow, AbstractInsnNode instruction) {
         if (!(instruction instanceof MethodInsnNode call) || call.getOpcode() != Opcodes.INVOKEVIRTUAL
                 || !call.name.equals("getSpellPower") || !call.desc.equals(POWER_DESCRIPTOR)) return null;
-        AbstractInsnNode receiver = operand(method, frames, call, 2);
-        AbstractInsnNode level = operand(method, frames, call, 1);
-        AbstractInsnNode caster = operand(method, frames, call, 0);
+        AbstractInsnNode receiver = operand(flow, call, 2);
+        AbstractInsnNode level = operand(flow, call, 1);
+        AbstractInsnNode caster = operand(flow, call, 0);
         if (!(receiver instanceof VarInsnNode self) || self.getOpcode() != Opcodes.ALOAD || self.var != 0
                 || !(level instanceof VarInsnNode integer) || integer.getOpcode() != Opcodes.ILOAD
                 || !(caster instanceof VarInsnNode actor) || actor.getOpcode() != Opcodes.ALOAD) return null;
         return new Power(call, integer.var, actor.var);
     }
 
-    private static AbstractInsnNode operand(MethodNode method, Frame<SourceValue>[] frames, AbstractInsnNode instruction,
+    private static AbstractInsnNode operand(FormulaDataFlow.Analysis flow, AbstractInsnNode instruction,
                                              int offset) {
-        Frame<SourceValue> frame = frames[method.instructions.indexOf(instruction)];
-        return frame == null || frame.getStackSize() <= offset ? null
-                : source(frame.getStack(frame.getStackSize() - 1 - offset));
+        var inputs = flow.operands(instruction);
+        return inputs.size() <= offset ? null : source(inputs.get(inputs.size() - 1 - offset));
     }
 
-    private static AbstractInsnNode source(SourceValue value) {
+    private static AbstractInsnNode source(FormulaDataFlow.Value value) {
         return value == null || value.insns.size() != 1 ? null : value.insns.iterator().next();
     }
 

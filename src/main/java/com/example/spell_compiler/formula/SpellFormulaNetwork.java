@@ -8,17 +8,23 @@ import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.eventbus.api.EventPriority;
+import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.OnDatapackSyncEvent;
-import net.minecraftforge.eventbus.api.EventPriority;
-import net.minecraftforge.eventbus.api.SubscribeEvent;
-import net.minecraftforge.fml.common.Mod;
-import net.minecraftforge.network.NetworkDirection;
-import net.minecraftforge.network.NetworkEvent;
-import net.minecraftforge.network.NetworkRegistry;
+import net.minecraftforge.event.entity.player.PlayerEvent;
+import net.minecraftforge.event.server.ServerStoppedEvent;
+import net.minecraftforge.server.ServerLifecycleHooks;
 import net.minecraftforge.network.PacketDistributor;
+import net.minecraftforge.network.NetworkDirection;
+import net.minecraftforge.network.NetworkRegistry;
 import net.minecraftforge.network.simple.SimpleChannel;
+import java.util.Optional;
+import net.minecraftforge.network.NetworkEvent;
+import java.util.function.Supplier;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -31,51 +37,68 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.TreeSet;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Supplier;
 
 public final class SpellFormulaNetwork {
-    private static final String PROTOCOL = "10";
+    private static final String PROTOCOL = "18";
     static final int MAX_FILE_BYTES = 256 * 1024;
     static final int MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
     static final int MAX_PART_BYTES = 256 * 1024;
     static final int PART_DATA_BYTES = 240 * 1024;
     private static final int MAX_KEY_BYTES = 256;
     private static final int MAX_RESOURCES = 512;
+    private static final int MAX_DISABLED = 16_384;
+    private static final int MAX_BINDING_BYTES = 4096;
     private static final AtomicLong GENERATION = new AtomicLong();
     private static final Reassembler PENDING = new Reassembler();
     private static final FormulaNativeConfigNetwork.Staging ORIGINAL_PENDING = new FormulaNativeConfigNetwork.Staging();
+    private static final Deliveries DELIVERIES = new Deliveries();
+    private static Object clientConnection;
+    private static long clientGeneration;
+    private static boolean initialized;
     private static SimpleChannel channel;
 
     private SpellFormulaNetwork() {}
 
-    public static synchronized void initialize() {
-        if (channel != null) return;
-        channel = NetworkRegistry.newSimpleChannel(ResourceLocation.fromNamespaceAndPath(
-                SpellCompiler.MODID, "spell_formula_config"), () -> PROTOCOL, PROTOCOL::equals, PROTOCOL::equals);
+    public static synchronized void initialize(IEventBus modBus) {
+        if (initialized) return;
+        channel = NetworkRegistry.newSimpleChannel(new ResourceLocation(SpellCompiler.MODID, "spell_formula_config"),
+                () -> PROTOCOL, PROTOCOL::equals, PROTOCOL::equals);
         channel.registerMessage(0, SnapshotPacket.class, SnapshotPacket::encode, SnapshotPacket::decode,
                 SnapshotPacket::handle, Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         channel.registerMessage(1, FormulaNativeConfigNetwork.Packet.class, FormulaNativeConfigNetwork.Packet::encode,
                 FormulaNativeConfigNetwork.Packet::decode, FormulaNativeConfigNetwork.Packet::handle,
                 Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+        channel.registerMessage(2, DisabledPacket.class, DisabledPacket::encode, DisabledPacket::decode,
+                DisabledPacket::handle, Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         MinecraftForge.EVENT_BUS.addListener(EventPriority.LOWEST, SpellFormulaNetwork::synchronize);
+        MinecraftForge.EVENT_BUS.addListener(SpellFormulaNetwork::playerLeft);
+        MinecraftForge.EVENT_BUS.addListener(SpellFormulaNetwork::serverStopped);
+        FormulaRuntimeDispatcher.onServerFailure(SpellFormulaNetwork::serverFailed);
+        initialized = true;
     }
+
 
     private static void synchronize(OnDatapackSyncEvent event) {
         try {
             long generation = GENERATION.incrementAndGet();
             var snapshot = SpellFormulaState.serverSnapshot();
-            var packets = packets(SpellFormulaFiles.resourcesForSnapshot(snapshot), generation);
+            Object bindings = FormulaRuntimeDispatcher.serverBindingsIdentity();
+            var packets = packets(SpellFormulaFiles.resourcesForSnapshot(snapshot), generation,
+                    FormulaRuntimeDispatcher.disabledServerKeys());
             var original = new FormulaNativeConfigNetwork.Packet(generation, FormulaNativeValues.exportOriginalConfig(snapshot),
                     SpellFormulaState.catalogFingerprint());
             SpellRegistry.onConfigReload();
-            if (event.getPlayer() != null) channel.send(PacketDistributor.PLAYER.with(event::getPlayer), original);
-            else channel.send(PacketDistributor.ALL.noArg(), original);
-            for (var packet : packets) {
-                if (event.getPlayer() != null) channel.send(PacketDistributor.PLAYER.with(event::getPlayer), packet);
-                else channel.send(PacketDistributor.ALL.noArg(), packet);
+            var players = event.getPlayer() != null ? List.of(event.getPlayer()) : List.copyOf(event.getPlayerList().getPlayers());
+            for (var player : players) {
+                channel.send(PacketDistributor.PLAYER.with(() -> player), original);
+                for (var packet : packets) channel.send(PacketDistributor.PLAYER.with(() -> player), packet);
+                DELIVERIES.install(player.connection, generation, bindings);
             }
         } catch (RuntimeException | LinkageError failure) {
             SpellCompiler.LOGGER.error("[SpellFormula] 无法同步服务器法术公式", failure);
@@ -87,12 +110,20 @@ public final class SpellFormulaNetwork {
         validateResources(SpellFormulaFiles.resourcesForSnapshot(snapshot));
     }
 
+    static void validateSnapshot(SpellFormulaFiles.Snapshot snapshot, Set<String> bindings) {
+        encodeResources(SpellFormulaFiles.resourcesForSnapshot(snapshot), bindings);
+    }
+
     static void validateResources(Map<String, JsonElement> resources) {
         encodeResources(resources);
     }
 
     public static List<SnapshotPacket> packets(Map<String, JsonElement> resources, long generation) {
-        byte[] data = encodeResources(resources);
+        return packets(resources, generation, Set.of());
+    }
+
+    static List<SnapshotPacket> packets(Map<String, JsonElement> resources, long generation, Set<String> disabled) {
+        byte[] data = encodeResources(resources, disabled);
         int count = (data.length + PART_DATA_BYTES - 1) / PART_DATA_BYTES;
         List<SnapshotPacket> result = new ArrayList<>(count);
         for (int index = 0; index < count; index++) {
@@ -104,6 +135,7 @@ public final class SpellFormulaNetwork {
     }
 
     public record SnapshotPacket(long generation, int index, int count, int totalLength, byte[] data) {
+
         public SnapshotPacket {
             if (generation <= 0 || totalLength < 1 || totalLength > MAX_SNAPSHOT_BYTES
                     || count != (totalLength + PART_DATA_BYTES - 1) / PART_DATA_BYTES
@@ -127,6 +159,7 @@ public final class SpellFormulaNetwork {
         public byte[] data() {
             return data.clone();
         }
+
 
         public Map<String, JsonElement> resources() {
             if (count != 1) throw new IllegalStateException("Spell formula snapshot requires reassembly");
@@ -159,11 +192,11 @@ public final class SpellFormulaNetwork {
         public void handle(Supplier<NetworkEvent.Context> supplier) {
             var context = supplier.get();
             context.enqueueWork(() -> {
-                if (!context.getNetworkManager().isConnected()) return;
+                if (!acceptsConnection(context)) return;
                 try {
-                    var resources = PENDING.accept(this);
-                    if (resources == null) return;
-                    var snapshot = SpellFormulaFiles.parseResources(resources, SpellFormulaState.catalog());
+                    var received = PENDING.acceptSnapshot(this);
+                    if (received == null) return;
+                    var snapshot = SpellFormulaFiles.parseResources(received.resources(), SpellFormulaState.catalog());
                     if (!snapshot.diagnostics().isEmpty()) {
                         snapshot.diagnostics().forEach(SpellFormulaRuntime::logDiagnostic);
                         throw new IllegalArgumentException("Invalid server formula snapshot");
@@ -173,10 +206,10 @@ public final class SpellFormulaNetwork {
                             .collect(java.util.stream.Collectors.toSet());
                     if (!originals.keySet().equals(expected))
                         throw new IllegalArgumentException("原生法术配置与公式法术列表不匹配");
-                    FormulaNativeValues.applyOriginalConfig(originals);
-                    var effective = SpellFormulaRuntime.applyClient(snapshot);
+                    var effective = installSnapshot(snapshot, originals, received.disabled());
                     if (!effective.fingerprint().equals(snapshot.fingerprint()))
                         throw new IllegalStateException("Server formula snapshot could not be compiled");
+                    clientGeneration = generation;
                 } catch (RuntimeException | LinkageError failure) {
                     rejectSync(context, failure);
                 }
@@ -189,10 +222,110 @@ public final class SpellFormulaNetwork {
         ORIGINAL_PENDING.accept(packet, SpellFormulaState.catalogFingerprint());
     }
 
+    static SpellFormulaFiles.Snapshot installSnapshot(SpellFormulaFiles.Snapshot snapshot,
+            Map<String, FormulaNativeConfigNetwork.Values> originals, Set<String> disabled) {
+        var previous = FormulaNativeValues.configCheckpoint();
+        try {
+            FormulaNativeValues.applyOriginalConfig(originals);
+            return SpellFormulaRuntime.applyClient(snapshot, disabled);
+        } catch (RuntimeException | LinkageError failure) {
+            FormulaNativeValues.restoreClientConfig(previous);
+            throw failure;
+        }
+    }
+
+    static boolean acceptsConnection(NetworkEvent.Context context) {
+        if (!ClientEvents.isCurrentConnection(context)) return false;
+        if (clientConnection == null) clientConnection = context.getNetworkManager();
+        return clientConnection == context.getNetworkManager();
+    }
+
+    private static void serverFailed(String key, FormulaRuntimeDispatcher.Invoker invoker) {
+        var server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) return;
+        server.execute(() -> {
+            if (ServerLifecycleHooks.getCurrentServer() != server || !FormulaRuntimeDispatcher.isCurrentServerInvoker(key, invoker)) return;
+            for (var player : server.getPlayerList().getPlayers()) {
+                long generation = DELIVERIES.generation(player.connection);
+                if (generation != 0) channel.send(PacketDistributor.PLAYER.with(() -> player), new DisabledPacket(generation, key));
+            }
+        });
+    }
+
+    private static void playerLeft(PlayerEvent.PlayerLoggedOutEvent event) {
+        if (event.getEntity() instanceof net.minecraft.server.level.ServerPlayer player) DELIVERIES.remove(player.connection);
+    }
+
+    private static void serverStopped(ServerStoppedEvent event) { DELIVERIES.clear(); }
+
+    static final class Deliveries {
+        private record Delivery(long generation, Object bindings) {}
+        private final Map<Object, Delivery> generations = new IdentityHashMap<>();
+        void install(Object connection, long generation) {
+            install(connection, generation, FormulaRuntimeDispatcher.serverBindingsIdentity());
+        }
+        void install(Object connection, long generation, Object bindings) {
+            generations.put(connection, new Delivery(generation, bindings));
+        }
+        long generation(Object connection) {
+            var delivery = generations.get(connection);
+            return delivery != null && delivery.bindings() == FormulaRuntimeDispatcher.serverBindingsIdentity() ? delivery.generation() : 0;
+        }
+        void remove(Object connection) { generations.remove(connection); }
+        void clear() { generations.clear(); }
+    }
+
+    public record DisabledPacket(long generation, String key) {
+
+        public DisabledPacket {
+            if (generation <= 0) throw new IllegalArgumentException("Invalid disabled formula generation");
+            requireBinding(key);
+        }
+
+
+        public void encode(FriendlyByteBuf buffer) {
+            buffer.writeLong(generation);
+            buffer.writeByteArray(key.getBytes(StandardCharsets.UTF_8));
+        }
+
+        public static DisabledPacket decode(FriendlyByteBuf buffer) {
+            if (buffer.readableBytes() > MAX_BINDING_BYTES + 13) throw new IllegalArgumentException("Disabled formula packet is too large");
+            var packet = new DisabledPacket(buffer.readLong(), utf8(buffer.readByteArray(MAX_BINDING_BYTES)));
+            if (buffer.isReadable()) throw new IllegalArgumentException("Trailing disabled formula bytes");
+            return packet;
+        }
+
+        public void handle(Supplier<NetworkEvent.Context> supplier) {
+            var context = supplier.get();
+            context.enqueueWork(() -> {
+                if (!acceptsConnection(context)) return;
+                try {
+                    apply(clientGeneration);
+                } catch (RuntimeException | LinkageError failure) {
+                    rejectSync(context, failure);
+                }
+            });
+            context.setPacketHandled(true);
+        }
+
+        void apply(long installedGeneration) {
+            if (generation < installedGeneration) return;
+            if (generation != installedGeneration) throw new IllegalArgumentException("Disabled formula generation has not been installed");
+            FormulaRuntimeDispatcher.disableClient(key);
+        }
+    }
+
+    record ReceivedSnapshot(Map<String, JsonElement> resources, Set<String> disabled) {
+        ReceivedSnapshot {
+            resources = Map.copyOf(resources);
+            disabled = Set.copyOf(disabled);
+        }
+    }
+
     static void rejectSync(NetworkEvent.Context context, Throwable failure) {
         PENDING.reset();
         ORIGINAL_PENDING.reset();
-        FormulaNativeValues.resetConfig(true);
+        clientGeneration = 0;
         SpellCompiler.LOGGER.error("[SpellFormula] 无法应用服务器法术公式", failure);
         context.getNetworkManager().disconnect(Component.translatable("disconnect.spell_compiler.formula_sync_failed"));
     }
@@ -206,6 +339,11 @@ public final class SpellFormulaNetwork {
         private ByteArrayOutputStream pending;
 
         Map<String, JsonElement> accept(SnapshotPacket packet) {
+            var received = acceptSnapshot(packet);
+            return received == null ? null : received.resources();
+        }
+
+        ReceivedSnapshot acceptSnapshot(SnapshotPacket packet) {
             if (packet.generation < generation) return null;
             if (packet.generation == completed)
                 throw new IllegalArgumentException("Duplicate completed spell formula snapshot");
@@ -225,9 +363,9 @@ public final class SpellFormulaNetwork {
             if (pending.size() != total) throw new IllegalArgumentException("Incomplete spell formula snapshot");
             byte[] data = pending.toByteArray();
             pending = null;
-            Map<String, JsonElement> resources = decodeResources(data);
+            var received = decodeSnapshot(data);
             completed = generation;
-            return resources;
+            return received;
         }
 
         void reset() {
@@ -247,7 +385,12 @@ public final class SpellFormulaNetwork {
     }
 
     private static byte[] encodeResources(Map<String, JsonElement> resources) {
+        return encodeResources(resources, Set.of());
+    }
+
+    private static byte[] encodeResources(Map<String, JsonElement> resources, Set<String> disabled) {
         if (resources.size() > MAX_RESOURCES) throw new IllegalArgumentException("Too many spell formula resources");
+        if (disabled.size() > MAX_DISABLED) throw new IllegalArgumentException("Too many disabled formulas");
         FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.buffer());
         try {
             buffer.writeVarInt(resources.size());
@@ -263,6 +406,16 @@ public final class SpellFormulaNetwork {
                 buffer.writeByteArray(key);
                 buffer.writeByteArray(json);
             }
+            if (!disabled.isEmpty()) {
+                buffer.writeVarInt(disabled.size());
+                for (String key : new TreeSet<>(disabled)) {
+                    requireBinding(key);
+                    byte[] bytes = key.getBytes(StandardCharsets.UTF_8);
+                    if (buffer.writerIndex() + FriendlyByteBuf.getVarIntSize(bytes.length) + bytes.length > MAX_SNAPSHOT_BYTES)
+                        throw new IllegalArgumentException("Spell formula snapshot is too large");
+                    buffer.writeByteArray(bytes);
+                }
+            }
             byte[] bytes = new byte[buffer.readableBytes()];
             buffer.readBytes(bytes);
             return bytes;
@@ -272,6 +425,10 @@ public final class SpellFormulaNetwork {
     }
 
     private static Map<String, JsonElement> decodeResources(byte[] data) {
+        return decodeSnapshot(data).resources();
+    }
+
+    private static ReceivedSnapshot decodeSnapshot(byte[] data) {
         if (data.length > MAX_SNAPSHOT_BYTES) throw new IllegalArgumentException("Spell formula snapshot is too large");
         FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.wrappedBuffer(data));
         try {
@@ -285,13 +442,28 @@ public final class SpellFormulaNetwork {
                 if (resources.putIfAbsent(key, SpellFormulaFiles.parseJson(json)) != null)
                     throw new IllegalArgumentException("Duplicate spell formula resource: " + key);
             }
+            Set<String> disabled = new HashSet<>();
+            if (buffer.isReadable()) {
+                int disabledCount = buffer.readVarInt();
+                if (disabledCount < 1 || disabledCount > MAX_DISABLED) throw new IllegalArgumentException("Invalid disabled formula count");
+                for (int index = 0; index < disabledCount; index++) {
+                    String key = utf8(buffer.readByteArray(MAX_BINDING_BYTES));
+                    requireBinding(key);
+                    if (!disabled.add(key)) throw new IllegalArgumentException("Duplicate disabled formula");
+                }
+            }
             if (buffer.isReadable()) throw new IllegalArgumentException("Trailing spell formula snapshot bytes");
-            return Map.copyOf(resources);
+            return new ReceivedSnapshot(resources, disabled);
         } catch (IOException failure) {
             throw new IllegalArgumentException("Invalid spell formula snapshot JSON", failure);
         } finally {
             buffer.release();
         }
+    }
+
+    private static void requireBinding(String key) {
+        if (key == null || key.isEmpty() || key.getBytes(StandardCharsets.UTF_8).length > MAX_BINDING_BYTES)
+            throw new IllegalArgumentException("Invalid disabled formula key");
     }
 
     private static String utf8(byte[] bytes) {
@@ -305,10 +477,26 @@ public final class SpellFormulaNetwork {
 
     @Mod.EventBusSubscriber(modid = SpellCompiler.MODID, value = Dist.CLIENT)
     public static final class ClientEvents {
+        private static boolean isCurrentConnection(NetworkEvent.Context context) {
+            var listener = net.minecraft.client.Minecraft.getInstance().getConnection();
+            return context.getNetworkManager().isConnected() && listener != null && listener.getConnection() == context.getNetworkManager();
+        }
+
         @SubscribeEvent
-        public static void logout(ClientPlayerNetworkEvent.LoggingOut event) {
+        public static void login(ClientPlayerNetworkEvent.LoggingIn event) {
             PENDING.reset();
             ORIGINAL_PENDING.reset();
+            clientConnection = event.getConnection();
+            clientGeneration = 0;
+        }
+
+        @SubscribeEvent
+        public static void logout(ClientPlayerNetworkEvent.LoggingOut event) {
+            if (clientConnection != null && event.getConnection() != null && clientConnection != event.getConnection()) return;
+            PENDING.reset();
+            ORIGINAL_PENDING.reset();
+            clientGeneration = 0;
+            clientConnection = null;
             SpellFormulaRuntime.resetClient();
         }
     }

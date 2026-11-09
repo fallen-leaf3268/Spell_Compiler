@@ -78,14 +78,14 @@ public final class FormulaDurationSafety {
     public static int guardAoeDuration(Object created, int duration, Object spell, String method, int level, Object caster) {
         if (!modified(spell, caster) || !(created instanceof AoeEntity area)) return duration;
         try {
-            Math.addExact(duration, area.getDelay());
+            Math.addExact(duration, FormulaSpellConfig.aoeDelay(area));
             return duration;
         } catch (ArithmeticException failure) {
             int fallback = originalDuration(spell, method, level, caster, failure).intValue();
             float multiplier = durationMultiplier(spell, caster);
             try {
                 int scaled = multiplier == 1 ? fallback : FormulaFunctions.roundExact(fallback * multiplier);
-                Math.addExact(scaled, area.getDelay());
+                Math.addExact(scaled, FormulaSpellConfig.aoeDelay(area));
                 return scaled;
             } catch (ArithmeticException fallbackFailure) {
                 FormulaNativeValues.report(spell, method + ":aoe_expiration", caster, fallbackFailure);

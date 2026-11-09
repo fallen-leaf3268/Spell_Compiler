@@ -28,7 +28,6 @@ public final class FormulaWidePower {
 
     static Map<String, AutomaticFormulaExtractor.Variable> variables(MethodNode method,
             FormulaClassRepository repository, Map<String, AutomaticFormulaExtractor.Variable> original) {
-        if (!applies(original)) return original;
         if ((method.access & Opcodes.ACC_STATIC) != 0)
             throw new IllegalArgumentException("强度参数的 64 位读取不支持静态公式入口");
         int caster = casterSlot(method, repository);

@@ -14,13 +14,14 @@ import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 
 public final class FormulaDelegateFactory {
     private static final String ACCESSORS = "com/example/spell_compiler/formula/FormulaDelegateAccessors";
     private static final AtomicLong SERIAL = new AtomicLong();
-    private record CacheKey(Map<String, String> overrides, boolean named, boolean widePower, String receiverClass) {}
+    private record CacheKey(Map<String, String> overrides, boolean named, boolean widePower, String receiverClass, Set<String> forced) {}
     private record CompiledInvoker(FormulaRuntimeDispatcher.Invoker delegate, boolean nativePower)
             implements FormulaRuntimeDispatcher.Invoker {
         @Override
@@ -62,21 +63,34 @@ public final class FormulaDelegateFactory {
 
     private static Map<String, FormulaRuntimeDispatcher.Invoker> compileSpell(Class<?> owner,
             SpellFormulaCatalog.Spell definition, Map<String, String> overrides, boolean widePower, boolean configured) {
+        return compileSpell(owner, definition, overrides, widePower, configured, Set.of());
+    }
+
+    public static Map<String, FormulaRuntimeDispatcher.Invoker> compileSpell(Class<?> owner,
+            SpellFormulaCatalog.Spell definition, Map<String, String> overrides, boolean widePower, Set<String> forced) {
+        return compileSpell(owner, definition, overrides, widePower, true, Set.copyOf(forced));
+    }
+
+    private static Map<String, FormulaRuntimeDispatcher.Invoker> compileSpell(Class<?> owner,
+            SpellFormulaCatalog.Spell definition, Map<String, String> overrides, boolean widePower, boolean configured, Set<String> forced) {
         if (!owner.getName().equals(definition.className()))
             throw new IllegalArgumentException("公式目录与法术类不符：" + definition.id());
         Map<String, SpellFormulaCatalog.Method> methods = new LinkedHashMap<>();
         definition.formulas().forEach(method -> methods.put(method.key(), method));
         Map<String, String> nativeMethods = new LinkedHashMap<>();
         Map<String, String> siteMethods = new LinkedHashMap<>();
+        Map<String, String> numericMethods = new LinkedHashMap<>();
         for (var entry : overrides.entrySet()) {
             var binding = methods.get(entry.getKey());
             if (binding == null) throw new IllegalArgumentException("未知公式绑定：" + entry.getKey());
             if (binding.declaringClass().equals("com.example.spell_compiler.formula.FormulaSiteValues"))
                 siteMethods.put(entry.getKey(), entry.getValue());
+            else if (binding.declaringClass().equals(FormulaNumericValues.class.getName()))
+                numericMethods.put(entry.getKey(), entry.getValue());
             else nativeMethods.put(entry.getKey(), entry.getValue());
         }
         Map<String, FormulaRuntimeDispatcher.Invoker> result = new LinkedHashMap<>(
-                compile(owner, nativeMethods, false, widePower, definition.className()));
+                compile(owner, nativeMethods, false, widePower, definition.className(), forced));
         if (!siteMethods.isEmpty()) {
             try {
                 Class<?> values = Class.forName("com.example.spell_compiler.formula.FormulaSiteValues", false,
@@ -86,23 +100,62 @@ public final class FormulaDelegateFactory {
                 throw new IllegalArgumentException("找不到原生数值入口", failure);
             }
         }
+        Map<String, FormulaNumericSites.Definition> numericDefinitions = new LinkedHashMap<>();
+        Map<String, FormulaAutomaticSites.Site> automaticSites = new LinkedHashMap<>();
+        for (var entry : numericMethods.entrySet()) {
+            var numeric = FormulaNumericHooks.definition(FormulaRuntimeDispatcher.key(definition.className(), entry.getKey()));
+            if (numeric == null) throw new IllegalArgumentException("找不到消费数值入口：" + entry.getKey());
+            numericDefinitions.put(entry.getKey(), numeric);
+            var automatic = FormulaAutomaticSites.find(numeric.dispatchKey());
+            if (automatic != null) automaticSites.put(entry.getKey(), automatic);
+            var binding = methods.get(entry.getKey());
+            Map<String, Type> variableTypes = new LinkedHashMap<>();
+            binding.variables().forEach((name, type) -> variableTypes.put(name, Type.getType(type)));
+            String resolved = ReadableFormula.resolve(binding.strictExpression(), entry.getValue(), variableTypes).expression();
+            var invoker = automatic != null && !automatic.inputs().isEmpty()
+                    ? FormulaCapturedValues.compile(resolved, automatic.inputs()) : compileNumeric(resolved, forced.contains(entry.getKey()));
+            if (invoker != null) result.put(entry.getKey(), invoker);
+        }
         Map<String, FormulaRuntimeDispatcher.Invoker> checked = new LinkedHashMap<>();
         result.forEach((key, invoker) -> {
             var binding = methods.get(key);
-            if (configured) FormulaMethodCompatibility.requireCompatible(binding.declaringClass(), key);
-            boolean finalDamage = configured && damageValue(binding.alias())
+            boolean site = binding.declaringClass().equals(FormulaSiteValues.class.getName());
+            boolean numeric = binding.declaringClass().equals(FormulaNumericValues.class.getName());
+            boolean nonnegative = requiresNonnegativeResult(binding);
+            if (configured && !numeric) FormulaMethodCompatibility.requireCompatible(binding.declaringClass(), key);
+            boolean finalDamage = configured && !numeric && damageValue(binding.alias())
                     && invoker instanceof CompiledInvoker compiled && !compiled.nativePower();
+            var numericDefinition = numericDefinitions.get(key);
+            var automatic = automaticSites.get(key);
+            boolean automaticDamage = configured && automatic != null
+                    && automatic.kind() == FormulaAutomaticSites.Kind.DAMAGE
+                    && !java.util.regex.Pattern.compile("\\bnative_value\\b").matcher(overrides.get(key)).find()
+                    && automatic.inputs().stream().noneMatch(input -> (input.nativePower() || input.powerUnknown())
+                    && Pattern.compile("\\b" + Pattern.quote(input.name()) + "\\b").matcher(overrides.get(key)).find());
             checked.put(key, (receiver, arguments) -> {
                 Number value = invoker.invoke(receiver, arguments);
-                if (binding.declaringClass().equals("com.example.spell_compiler.formula.FormulaSiteValues"))
+                if (automaticDamage) value = finishDamage(value, receiver, arguments, owner, definition, binding);
+                if (site)
                     FormulaSiteHooks.validateValue(key, value, arguments);
-                else if (requiresNonnegativeResult(binding) && value.doubleValue() < 0)
+                else if (numeric)
+                    value = FormulaNumericHooks.validate(numericDefinition, value, arguments);
+                else if (nonnegative && value.doubleValue() < 0)
                     throw new ArithmeticException("法术消耗和时间不能为负数：" + binding.alias());
                 if (finalDamage) value = finishDamage(value, receiver, arguments, owner, definition, binding);
                 return value;
             });
         });
         return Map.copyOf(checked);
+    }
+
+    static FormulaRuntimeDispatcher.Invoker compileNumeric(String expression) {
+        return compileNumeric(expression, false);
+    }
+
+    private static FormulaRuntimeDispatcher.Invoker compileNumeric(String expression, boolean forced) {
+        String valueKey = "value" + FormulaNumericSites.VALUE_DESCRIPTOR;
+        return compile(FormulaNumericValues.class, Map.of(valueKey, expression), false, false, null,
+                forced ? Set.of(valueKey) : Set.of()).get(valueKey);
     }
 
     private static boolean damageValue(String alias) {
@@ -118,12 +171,15 @@ public final class FormulaDelegateFactory {
                 caster = argument;
                 break;
             }
-        if (binding.declaringClass().equals("com.example.spell_compiler.formula.FormulaSiteValues")) {
+        if (binding.declaringClass().equals(FormulaNumericValues.class.getName())) {
+            spell = arguments[5];
+            caster = arguments[6];
+        } else if (binding.declaringClass().equals("com.example.spell_compiler.formula.FormulaSiteValues")) {
             spell = arguments[arguments.length - 2];
             caster = arguments[arguments.length - 1];
         } else if (spell == null && io.redspace.ironsspellbooks.api.spells.AbstractSpell.class.isAssignableFrom(owner)) {
             spell = io.redspace.ironsspellbooks.api.registry.SpellRegistry.REGISTRY.get()
-                    .getValue(net.minecraft.resources.ResourceLocation.parse(definition.id()));
+                    .getValue(new net.minecraft.resources.ResourceLocation(definition.id()));
         }
         float multiplier = FormulaFunctions.requireFinite(FormulaIntegration.damageMultiplier(spell, caster));
         if (multiplier == 1) return value;
@@ -154,16 +210,22 @@ public final class FormulaDelegateFactory {
     private static Map<String, FormulaRuntimeDispatcher.Invoker> compile(Class<?> owner, Map<String, String> overrides,
                                                                         boolean forceNamed, boolean widePower,
                                                                         String receiverClass) {
+        return compile(owner, overrides, forceNamed, widePower, receiverClass, Set.of());
+    }
+
+    private static Map<String, FormulaRuntimeDispatcher.Invoker> compile(Class<?> owner, Map<String, String> overrides,
+                                                                        boolean forceNamed, boolean widePower,
+                                                                        String receiverClass, Set<String> forced) {
         Objects.requireNonNull(owner);
         Objects.requireNonNull(overrides);
         if (overrides.isEmpty()) return Map.of();
         Map<String, String> stable = Map.copyOf(overrides);
         Cache cache = CACHE.get(owner);
-        CacheKey key = new CacheKey(stable, forceNamed, widePower, receiverClass);
+        CacheKey key = new CacheKey(stable, forceNamed, widePower, receiverClass, Set.copyOf(forced));
         synchronized (cache) {
             var existing = cache.entries.get(key);
             if (existing != null) return existing;
-            var result = compileUncached(owner, stable, forceNamed, widePower, receiverClass);
+            var result = compileUncached(owner, stable, forceNamed, widePower, receiverClass, forced);
             cache.entries.put(key, result);
             if (cache.entries.size() > 2) cache.entries.remove(cache.entries.keySet().iterator().next());
             return result;
@@ -173,17 +235,16 @@ public final class FormulaDelegateFactory {
     private static Map<String, FormulaRuntimeDispatcher.Invoker> compileUncached(Class<?> owner,
                                                                                Map<String, String> overrides,
                                                                                boolean forceNamed, boolean widePower,
-                                                                               String receiverClass) {
+                                                                               String receiverClass, Set<String> forced) {
         Map<Class<?>, Map<String, String>> groups = declaringGroups(owner, overrides);
         if (groups.size() != 1 || !groups.containsKey(owner)) {
             Map<String, FormulaRuntimeDispatcher.Invoker> combined = new LinkedHashMap<>();
             groups.forEach((declaring, changes) -> combined.putAll(
-                    compile(declaring, changes, forceNamed, widePower, receiverClass)));
+                    compile(declaring, changes, forceNamed, widePower, receiverClass, forced)));
             return Map.copyOf(combined);
         }
-        byte[] original = original(owner);
         ClassNode source = new ClassNode();
-        new ClassReader(original).accept(source, 0);
+        byte[] original = original(owner, source);
         FormulaClassRepository repository = FormulaClassRepository.of(source, owner.getClassLoader());
         Map<String, String> changed = new LinkedHashMap<>();
         Map<String, Boolean> powerStages = new LinkedHashMap<>();
@@ -197,7 +258,7 @@ public final class FormulaDelegateFactory {
             String resolved = ReadableFormula.resolve(analysis.formula().expression(), overrides.get(key), types).expression();
             powerStages.put(key, analysis.formula().nativePowers().keySet().stream()
                     .anyMatch(marker -> Pattern.compile("\\b" + Pattern.quote(marker) + "\\s*\\(").matcher(resolved).find()));
-            if (widePower && FormulaWidePower.applies(analysis.formula().variables())
+            if (forced.contains(key) || widePower && FormulaWidePower.applies(analysis.formula().variables())
                     || !compact(resolved).equals(compact(analysis.formula().expression()))) changed.put(key, overrides.get(key));
         }
         if (changed.isEmpty()) return Map.of();
@@ -286,7 +347,7 @@ public final class FormulaDelegateFactory {
         Map<Class<?>, Map<String, String>> groups = new LinkedHashMap<>();
         for (Class<?> cursor = owner; cursor != null && !unresolved.isEmpty(); cursor = cursor.getSuperclass()) {
             ClassNode source = new ClassNode();
-            new ClassReader(original(cursor)).accept(source, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            original(cursor, source);
             Map<String, String> selected = new LinkedHashMap<>();
             for (MethodNode method : source.methods) {
                 String key = method.name + method.desc;
@@ -301,7 +362,7 @@ public final class FormulaDelegateFactory {
         return groups;
     }
 
-    private static byte[] original(Class<?> owner) {
+    private static byte[] original(Class<?> owner, ClassNode source) {
         byte[] original;
         String resource = '/' + owner.getName().replace('.', '/') + ".class";
         try (var stream = owner.getResourceAsStream(resource)) {
@@ -310,7 +371,6 @@ public final class FormulaDelegateFactory {
         } catch (IOException failure) {
             throw new IllegalArgumentException("无法读取法术类：" + owner.getName(), failure);
         }
-        ClassNode source = new ClassNode();
         new ClassReader(original).accept(source, 0);
         if (!source.name.equals(owner.getName().replace('.', '/')))
             throw new IllegalArgumentException("原始法术类资源名称不匹配：" + owner.getName());
@@ -346,6 +406,7 @@ public final class FormulaDelegateFactory {
                         && call.name.equals("getSpellConfigValue")) {
                     call.owner = "com/example/spell_compiler/formula/FormulaNativeValues";
                     call.name = "readConfig";
+                    call.desc = "(Lio/redspace/ironsspellbooks/api/spells/AbstractSpell;Ljava/lang/Object;)Ljava/lang/Object;";
                 }
                 if (call.owner.equals("java/lang/invoke/MethodHandle")) continue;
                 if (call.name.equals("<init>")) throw new IllegalArgumentException("数值委托不支持构造调用：" + call.owner);

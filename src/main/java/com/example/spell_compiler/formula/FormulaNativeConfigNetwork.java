@@ -2,13 +2,13 @@ package com.example.spell_compiler.formula;
 
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
+import java.util.function.Supplier;
 
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.function.Supplier;
 
 public final class FormulaNativeConfigNetwork {
     static final int MAX_ENTRIES = 512;
@@ -26,6 +26,7 @@ public final class FormulaNativeConfigNetwork {
     }
 
     public record Packet(long generation, Map<String, Values> values, String catalogFingerprint) {
+
         public Packet {
             if (generation <= 0 || values == null || values.size() > MAX_ENTRIES)
                 throw new IllegalArgumentException("无效原生法术配置批次");
@@ -45,6 +46,7 @@ public final class FormulaNativeConfigNetwork {
         public Packet(long generation, Map<String, Values> values) {
             this(generation, values, SpellFormulaState.catalogFingerprint());
         }
+
 
         public void encode(FriendlyByteBuf buffer) {
             buffer.writeLong(generation);
@@ -77,7 +79,7 @@ public final class FormulaNativeConfigNetwork {
         public void handle(Supplier<NetworkEvent.Context> supplier) {
             var context = supplier.get();
             context.enqueueWork(() -> {
-                if (!context.getNetworkManager().isConnected()) return;
+                if (!SpellFormulaNetwork.acceptsConnection(context)) return;
                 try {
                     SpellFormulaNetwork.stageOriginalConfig(this);
                 } catch (RuntimeException | LinkageError failure) {

@@ -22,9 +22,15 @@ import java.util.stream.Collectors;
 public final class SpellFormulaReloadListener extends SimpleJsonResourceReloadListener {
     private List<SpellFormulaFiles.Diagnostic> readingDiagnostics = List.of();
     private Set<ResourceLocation> unreadableResources = Set.of();
+    private final Object resourceOwner;
 
     public SpellFormulaReloadListener() {
+        this(null);
+    }
+
+    SpellFormulaReloadListener(Object resourceOwner) {
         super(new Gson(), "spells");
+        this.resourceOwner = resourceOwner;
     }
 
     @Override
@@ -37,7 +43,7 @@ public final class SpellFormulaReloadListener extends SimpleJsonResourceReloadLi
             ResourceLocation key = null;
             try {
                 String path = location.getPath();
-                key = ResourceLocation.fromNamespaceAndPath(location.getNamespace(),
+                key = new ResourceLocation(location.getNamespace(),
                         path.substring(0, path.length() - ".json".length()));
                 resources.put(key, JsonNull.INSTANCE);
                 try (var stream = entry.getValue().open()) {
@@ -58,7 +64,7 @@ public final class SpellFormulaReloadListener extends SimpleJsonResourceReloadLi
 
     @Override
     protected void apply(Map<ResourceLocation, JsonElement> resources, ResourceManager manager, ProfilerFiller profiler) {
-        SpellFormulaRuntime.applyServer(snapshot(resources));
+        SpellFormulaRuntime.applyServer(snapshot(resources), resourceOwner);
     }
 
     public static SpellFormulaFiles.Snapshot load(ResourceManager manager) {

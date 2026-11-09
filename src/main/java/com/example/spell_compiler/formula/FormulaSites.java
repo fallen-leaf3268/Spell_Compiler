@@ -32,6 +32,9 @@ public final class FormulaSites {
 
     private record Selected(MethodNode method, Rule rule, List<AbstractInsnNode> points) {}
 
+    record BindingPoint(String alias, String owner, String method, String descriptor, int instruction,
+                        boolean replacesReturn) {}
+
     private static final String SPELLS = "io.redspace.ironsspellbooks.spells.";
     private static final String EFFECT = "io.redspace.ironsspellbooks.effect.ThunderstormEffect";
     private static final String HOOKS = "com/example/spell_compiler/formula/FormulaSiteHooks";
@@ -70,6 +73,25 @@ public final class FormulaSites {
 
     public static List<Definition> definitions(String spellClassName) {
         return DEFINITIONS.stream().filter(value -> value.spellClassName().equals(spellClassName)).toList();
+    }
+
+    static List<BindingPoint> bindingPoints(FormulaClassRepository repository, String spellClassName) {
+        if (!repository.baselineCoverage()) return List.of();
+        List<BindingPoint> result = new ArrayList<>();
+        for (String owner : targetClasses().stream().sorted().toList()) {
+            if (RULES.stream().noneMatch(rule -> rule.owner().equals(owner)
+                    && rule.definition().spellClassName().equals(spellClassName.replace('/', '.')))) continue;
+            ClassNode source = repository.classNode(owner.replace('.', '/'));
+            if (source == null) continue;
+            for (Selected selected : select(owner, source)) {
+                if (!selected.rule().definition().spellClassName().equals(spellClassName.replace('/', '.'))) continue;
+                List<AbstractInsnNode> executable = executable(selected.method());
+                for (AbstractInsnNode point : selected.points()) result.add(new BindingPoint(selected.rule().definition().alias(),
+                        owner.replace('.', '/'), selected.method().name, selected.method().desc, executable.indexOf(point),
+                        point.getOpcode() >= Opcodes.IRETURN && point.getOpcode() <= Opcodes.DRETURN));
+            }
+        }
+        return List.copyOf(result);
     }
 
     public static Set<String> targetClasses() {
@@ -167,7 +189,7 @@ public final class FormulaSites {
             return node.getOpcode() == Opcodes.FMUL && numeric(factor, 0.5f)
                     && health instanceof MethodInsnNode call && call.getOpcode() == Opcodes.INVOKEVIRTUAL
                     && call.owner.equals("net/minecraft/world/entity/LivingEntity")
-                    && Set.of("getHealth", "m_21223_").contains(call.name) && call.desc.equals("()F")
+                    && Set.of("getHealth", "m_21223_").contains(FormulaMinecraftNames.method(call.name)) && call.desc.equals("()F")
                     && previous(health) instanceof VarInsnNode load && load.getOpcode() == Opcodes.ALOAD
                     && opcode(next(node)) == Opcodes.FADD;
         }

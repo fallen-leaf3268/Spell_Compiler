@@ -26,11 +26,20 @@ import java.util.Set;
 
 public final class FormulaAddonDiscovery {
     public record Discovery(FormulaClassRepository repository, List<ClassNode> sources,
-                            Set<String> spellClasses, Map<String, String> owners) {
+                            Set<String> spellClasses, Map<String, String> owners,
+                            List<ClassNode> nativeSources, Set<String> nativeSpellClasses, String nativeFingerprint) {
         public Discovery {
             sources = List.copyOf(sources);
             spellClasses = Set.copyOf(spellClasses);
             owners = Map.copyOf(owners);
+            nativeSources = List.copyOf(nativeSources);
+            nativeSpellClasses = Set.copyOf(nativeSpellClasses);
+            nativeFingerprint = java.util.Objects.requireNonNull(nativeFingerprint);
+        }
+
+        public Discovery(FormulaClassRepository repository, List<ClassNode> sources,
+                         Set<String> spellClasses, Map<String, String> owners) {
+            this(repository, sources, spellClasses, owners, List.of(), Set.of(), "");
         }
 
         public String fingerprint() {
@@ -107,6 +116,8 @@ public final class FormulaAddonDiscovery {
             selectedFiles.add(entry.getValue().file());
         }
         List<ClassNode> sources = new ArrayList<>();
+        List<ClassNode> nativeSources = new ArrayList<>();
+        Set<String> nativeSpellClasses = new LinkedHashSet<>();
         Map<String, String> owners = new LinkedHashMap<>();
         Set<String> added = new HashSet<>();
         for (IModFile file : selectedFiles) {
@@ -116,15 +127,30 @@ public final class FormulaAddonDiscovery {
                 if (source == null) source = read(file, name);
                 sources.add(source);
                 owners.put(name, classes.get(name).modId());
+                if (nativeFiles.contains(file)) {
+                    nativeSources.add(source);
+                    if (!name.equals(ABSTRACT) && !mixins.contains(name)
+                            && isSpell(name, classes, subtypes, new HashSet<>()) && !isMixin(source))
+                        nativeSpellClasses.add(name);
+                }
             }
         }
-        if (sources.isEmpty()) throw new IOException("附属法术扫描没有找到铁魔法的原始类资源");
+        if (nativeSources.isEmpty()) throw new IOException("法术扫描没有找到可确认的铁魔法原始类资源");
         sources.sort(Comparator.comparing(value -> value.name));
         FormulaClassRepository repository = FormulaClassRepository.of(sources.get(0));
         for (int index = 1; index < sources.size(); index++) repository.add(sources.get(index));
+        Map<IModFile, String> sourceFingerprints = new HashMap<>();
+        for (IModFile file : selectedFiles) {
+            if (Files.isRegularFile(file.getFilePath()))
+                sourceFingerprints.put(file, repository.recordSourceFingerprint(file.getFilePath()));
+        }
         Set<String> names = new LinkedHashSet<>();
         candidates.keySet().stream().sorted().forEach(names::add);
-        current = new Discovery(repository, sources, names, owners);
+        String nativeFingerprint;
+        if (nativeFiles.size() == 1 && sourceFingerprints.containsKey(nativeFiles.iterator().next()))
+            nativeFingerprint = sourceFingerprints.get(nativeFiles.iterator().next());
+        else nativeFingerprint = new Discovery(repository, nativeSources, nativeSpellClasses, owners).fingerprint();
+        current = new Discovery(repository, sources, names, owners, nativeSources, nativeSpellClasses, nativeFingerprint);
         return current;
     }
 

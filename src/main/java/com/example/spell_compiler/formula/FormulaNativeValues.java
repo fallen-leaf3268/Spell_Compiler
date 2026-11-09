@@ -1,8 +1,5 @@
 package com.example.spell_compiler.formula;
 
-import io.redspace.ironsspellbooks.api.config.SpellConfigHolder;
-import io.redspace.ironsspellbooks.api.config.SpellConfigManager;
-import io.redspace.ironsspellbooks.api.config.SpellConfigParameter;
 import io.redspace.ironsspellbooks.api.registry.SpellRegistry;
 import io.redspace.ironsspellbooks.api.spells.AbstractSpell;
 import net.minecraft.resources.ResourceLocation;
@@ -27,9 +24,22 @@ public final class FormulaNativeValues {
     private static final Set<String> BASE_FIELDS = Set.of("baseManaCost", "manaCostPerLevel", "baseSpellPower", "spellPowerPerLevel", "castTime");
     private static final Logger LOGGER = LogManager.getLogger(FormulaNativeValues.class);
     private static final Set<String> FAILURES = ConcurrentHashMap.newKeySet();
-    private static volatile Map<String, SpellFormulaCatalog.Spell> definitions = Map.of();
-    private static volatile Map<AbstractSpell, Map<SpellConfigParameter<?>, Object>> serverConfig = Map.of();
-    private static volatile Map<AbstractSpell, Map<SpellConfigParameter<?>, Object>> clientConfig = Map.of();
+    private record MethodMetadata(SpellFormulaCatalog.Method definition, int levelIndex,
+                                  String nativeKey, String originalKey) {}
+    private record SpellMetadata(SpellFormulaCatalog.Spell definition, Map<String, MethodMetadata> methods) {}
+    private static volatile Map<String, SpellMetadata> definitions = Map.of();
+    private static volatile Map<AbstractSpell, Map<String, Object>> serverConfig = Map.of();
+    private static volatile Map<AbstractSpell, Map<String, Object>> clientConfig = Map.of();
+    record ConfigState(Map<AbstractSpell, Map<String, Object>> server, Map<AbstractSpell, Map<String, Object>> client) {}
+
+    static synchronized ConfigState configCheckpoint() { return new ConfigState(serverConfig, clientConfig); }
+
+    static synchronized void restoreConfig(ConfigState previous) {
+        serverConfig = previous.server();
+        clientConfig = previous.client();
+    }
+
+    static synchronized void restoreClientConfig(ConfigState previous) { clientConfig = previous.client(); }
     private static final ClassValue<Map<String, FormulaRuntimeDispatcher.Invoker>> NATIVE = new ClassValue<>() {
         @Override protected Map<String, FormulaRuntimeDispatcher.Invoker> computeValue(Class<?> owner) {
             return new ConcurrentHashMap<>();
@@ -39,9 +49,30 @@ public final class FormulaNativeValues {
     private FormulaNativeValues() {}
 
     public static void initialize(SpellFormulaCatalog catalog) {
-        Map<String, SpellFormulaCatalog.Spell> selected = new LinkedHashMap<>();
-        catalog.spells().forEach(spell -> selected.put(spell.className(), spell));
+        Map<String, SpellMetadata> selected = new LinkedHashMap<>();
+        catalog.spells().forEach(spell -> {
+            Map<String, MethodMetadata> methods = new LinkedHashMap<>();
+            for (var method : spell.formulas()) {
+                String key = method.key();
+                String nativeKey = key + '#' + method.strictExpression() + '#';
+                methods.put(key, new MethodMetadata(method, levelIndex(method), nativeKey + false, nativeKey + true));
+            }
+            selected.put(spell.className(), new SpellMetadata(spell, Map.copyOf(methods)));
+        });
         definitions = Map.copyOf(selected);
+    }
+
+    private static int levelIndex(SpellFormulaCatalog.Method method) {
+        if (method.declaringClass().equals(FormulaSiteValues.class.getName())
+                || !"I".equals(method.variables().get("level"))) return -1;
+        Type[] types = Type.getArgumentTypes(method.descriptor());
+        int levelIndex = -1;
+        for (int index = 0; index < types.length; index++) {
+            if (!types[index].equals(Type.INT_TYPE)) continue;
+            if (levelIndex >= 0) return -1;
+            levelIndex = index;
+        }
+        return levelIndex;
     }
 
     public static boolean isEvaluatingOriginal() {
@@ -51,8 +82,8 @@ public final class FormulaNativeValues {
 
     static boolean declaredBy(Object spell, String owner, String methodKey) {
         var definition = definitions.get(spell.getClass().getName());
-        return definition != null && definition.formulas().stream().anyMatch(method -> method.key().equals(methodKey)
-                && method.declaringClass().equals(owner.replace('/', '.')));
+        var method = definition == null ? null : definition.methods().get(methodKey);
+        return method != null && method.definition().declaringClass().equals(owner.replace('/', '.'));
     }
 
     public static boolean isModified(Object spell, Object caster) {
@@ -72,20 +103,19 @@ public final class FormulaNativeValues {
         return evaluate(spell, methodKey, arguments, true);
     }
 
-    static Number invokeConfigured(Object spell, String dispatchKey, Object[] arguments,
+    static Number invokeConfigured(Object spell, String methodKey, Object[] arguments,
                                    FormulaRuntimeDispatcher.Invoker invoker) throws Throwable {
-        int separator = dispatchKey.indexOf('#');
-        String methodKey = separator < 0 ? dispatchKey : dispatchKey.substring(separator + 1);
         return invoke(spell, methodKey, arguments, isEvaluatingOriginal(), true, invoker);
     }
 
     private static Number evaluate(Object spell, String methodKey, Object[] arguments, boolean original) throws Throwable {
         var definition = definitions.get(spell.getClass().getName());
         if (definition == null) throw new IllegalArgumentException("找不到原生数值目录：" + spell.getClass().getName());
-        var method = definition.formulas().stream().filter(value -> value.key().equals(methodKey)).findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("找不到原生数值方法：" + methodKey));
-        var invoker = NATIVE.get(spell.getClass()).computeIfAbsent(methodKey + '#' + method.strictExpression() + '#' + original, ignored -> {
-            var compiled = FormulaDelegateFactory.compileNativeSpell(spell.getClass(), definition,
+        var metadata = definition.methods().get(methodKey);
+        if (metadata == null) throw new IllegalArgumentException("找不到原生数值方法：" + methodKey);
+        var method = metadata.definition();
+        var invoker = NATIVE.get(spell.getClass()).computeIfAbsent(original ? metadata.originalKey() : metadata.nativeKey(), ignored -> {
+            var compiled = FormulaDelegateFactory.compileNativeSpell(spell.getClass(), definition.definition(),
                     Map.of(methodKey, '(' + method.readableExpression() + ")+0"), !original);
             var selected = compiled.get(methodKey);
             if (selected == null) throw new IllegalArgumentException("无法创建原生数值求值器：" + methodKey);
@@ -168,17 +198,9 @@ public final class FormulaNativeValues {
         if (evaluation == null || evaluation.original() || spell == null || evaluation.spell() != spell) return null;
         var definition = definitions.get(spell.getClass().getName());
         if (definition == null) return null;
-        var method = definition.formulas().stream().filter(value -> value.key().equals(evaluation.method()))
-                .findFirst().orElse(null);
-        if (method == null || method.declaringClass().equals(FormulaSiteValues.class.getName())
-                || !"I".equals(method.variables().get("level"))) return null;
-        Type[] types = Type.getArgumentTypes(method.descriptor());
-        int levelIndex = -1;
-        for (int index = 0; index < types.length; index++) {
-            if (!types[index].equals(Type.INT_TYPE)) continue;
-            if (levelIndex >= 0) return null;
-            levelIndex = index;
-        }
+        var method = definition.methods().get(evaluation.method());
+        if (method == null) return null;
+        int levelIndex = method.levelIndex();
         return levelIndex >= 0 && levelIndex < evaluation.arguments().length
                 && evaluation.arguments()[levelIndex] instanceof Integer level ? level : null;
     }
@@ -186,33 +208,29 @@ public final class FormulaNativeValues {
     static Number originalField(Object spell, String name) {
         if (!isEvaluatingOriginal() || !(spell instanceof AbstractSpell source) || !BASE_FIELDS.contains(name)) return null;
         var definition = definitions.get(spell.getClass().getName());
-        if (definition == null || !definition.parameters().has(name)) return null;
-        return SpellFormulaRuntime.originalParameter(source, name, definition.parameters().get(name).getAsInt());
-    }
-
-    public static <T> T readConfig(AbstractSpell spell, SpellConfigParameter<T> parameter) {
-        if (isEvaluatingOriginal()) return originalConfig(spell, parameter, actor());
-        return SpellConfigManager.getSpellConfigValue(spell, parameter);
+        if (definition == null || !definition.definition().parameters().has(name)) return null;
+        return SpellFormulaRuntime.originalParameter(source, name, definition.definition().parameters().get(name).getAsInt());
     }
 
     @SuppressWarnings("unchecked")
-    public static <T> T originalConfig(AbstractSpell spell, SpellConfigParameter<T> parameter, Object caster) {
-        var saved = (client(caster) ? clientConfig : serverConfig).get(spell);
-        if (saved != null && saved.containsKey(parameter)) return (T) saved.get(parameter);
-        return SpellConfigManager.getSpellConfigValue(spell, parameter);
+    public static <T> T readConfig(AbstractSpell spell, Object parameter) {
+        if (isEvaluatingOriginal()) return originalConfig(spell, parameter, actor());
+        return (T) FormulaSpellConfig.read(spell, FormulaSpellConfig.key(parameter));
     }
 
-    static synchronized void captureConfig(AbstractSpell spell, SpellConfigHolder holder) {
-        Map<SpellConfigParameter<?>, Object> values = new LinkedHashMap<>();
-        for (SpellConfigParameter<?> parameter : List.of(SpellConfigParameter.ENABLED, SpellConfigParameter.MAX_LEVEL,
-                SpellConfigParameter.MIN_RARITY, SpellConfigParameter.ALLOW_CRAFTING, SpellConfigParameter.SCHOOL,
-                SpellConfigParameter.COOLDOWN_IN_SECONDS, SpellConfigParameter.POWER_MULTIPLIER, SpellConfigParameter.MANA_MULTIPLIER)) {
-            Object value = holder.get(parameter);
-            if (value != null) values.put(parameter, value);
-        }
-        boolean clientSide = EffectiveSide.get().isClient();
+    @SuppressWarnings("unchecked")
+    public static <T> T originalConfig(AbstractSpell spell, Object parameter, Object caster) {
+        String key = FormulaSpellConfig.key(parameter);
+        var saved = (client(caster) ? clientConfig : serverConfig).get(spell);
+        if (saved != null && saved.containsKey(key)) return (T) saved.get(key);
+        return (T) FormulaSpellConfig.read(spell, key);
+    }
+
+    static synchronized void captureConfig(AbstractSpell spell, Map<String, Object> values, boolean clientSide, boolean preserveExisting) {
         var updated = new LinkedHashMap<>(clientSide ? clientConfig : serverConfig);
-        updated.put(spell, Map.copyOf(values));
+        var merged = new LinkedHashMap<>(values);
+        if (preserveExisting) merged.putAll(updated.getOrDefault(spell, Map.of()));
+        updated.put(spell, Map.copyOf(merged));
         if (clientSide) clientConfig = Map.copyOf(updated);
         else serverConfig = Map.copyOf(updated);
     }
@@ -229,24 +247,23 @@ public final class FormulaNativeValues {
             var values = serverConfig.get(spell);
             if (values == null) throw new IllegalStateException("未捕获服务器原生法术配置：" + override.spell().id());
             exported.put(override.spell().id(), new FormulaNativeConfigNetwork.Values(
-                    ((Number) values.get(SpellConfigParameter.MANA_MULTIPLIER)).doubleValue(),
-                    ((Number) values.get(SpellConfigParameter.POWER_MULTIPLIER)).doubleValue(),
-                    ((Number) values.get(SpellConfigParameter.COOLDOWN_IN_SECONDS)).doubleValue()));
+                    ((Number) values.get("mana_cost_multiplier")).doubleValue(),
+                    ((Number) values.get("power_multiplier")).doubleValue(),
+                    ((Number) values.get("cooldown_in_seconds")).doubleValue()));
         }
         return Map.copyOf(exported);
     }
 
     public static synchronized void applyOriginalConfig(Map<String, FormulaNativeConfigNetwork.Values> values) {
-        Map<AbstractSpell, Map<SpellConfigParameter<?>, Object>> updated = new LinkedHashMap<>();
+        Map<AbstractSpell, Map<String, Object>> updated = new LinkedHashMap<>();
         for (var entry : values.entrySet()) {
-            AbstractSpell spell = SpellRegistry.REGISTRY.get().getValue(ResourceLocation.parse(entry.getKey()));
+            AbstractSpell spell = SpellRegistry.REGISTRY.get().getValue(new ResourceLocation(entry.getKey()));
             var definition = spell == null ? null : definitions.get(spell.getClass().getName());
-            if (definition == null || !definition.id().equals(entry.getKey()))
+            if (definition == null || !definition.definition().id().equals(entry.getKey()))
                 throw new IllegalArgumentException("原生法术配置没有匹配的法术：" + entry.getKey());
             var value = entry.getValue();
-            updated.put(spell, Map.of(SpellConfigParameter.MANA_MULTIPLIER, value.manaMultiplier(),
-                    SpellConfigParameter.POWER_MULTIPLIER, value.powerMultiplier(),
-                    SpellConfigParameter.COOLDOWN_IN_SECONDS, value.cooldownSeconds()));
+            updated.put(spell, Map.of("mana_cost_multiplier", value.manaMultiplier(),
+                    "power_multiplier", value.powerMultiplier(), "cooldown_in_seconds", value.cooldownSeconds()));
         }
         clientConfig = Map.copyOf(updated);
     }

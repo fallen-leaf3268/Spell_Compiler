@@ -2,18 +2,20 @@
   "required": true,
   "minVersion": "0.8.5",
   "compatibilityLevel": "JAVA_17",
-  "package": "com.example.spell_compiler.mixin",
   "refmap": "spell_compiler.refmap.json",
+  "package": "com.example.spell_compiler.mixin",
+  "plugin": "com.example.spell_compiler.formula.FormulaFixedMixinPlugin",
   "mixins": [
     "FormulaBaseSpellMixin",
     "FormulaSacrificeMixin",
-    "ModifySpellConfigAccessor",
     "FormulaNumberFormattingMixin",
     "FormulaConsumerMixin$EffectData",
     "FormulaConsumerMixin$Attributes",
-    "FormulaConsumerMixin$Synchronization"
+    "FormulaConsumerMixin$Synchronization",
+    "FormulaConsumerMixin$Tooltips"
   ],
   "client": [
+    "FormulaTooltipTimeMixin",
     "compat.AttributesLibClientMixin"
   ]
 }

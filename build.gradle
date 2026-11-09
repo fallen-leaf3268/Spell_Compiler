@@ -7,7 +7,7 @@ plugins {
 
 version = mod_version
 group = mod_group_id
-base { archivesName = mod_id }
+base { archivesName = "${mod_id}-${minecraft_version}-forge" }
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 jarJar.enable()
 
@@ -41,16 +41,51 @@ sourceSets.main.resources {
 }
 sourceSets.main.java { srcDir 'build/generated/formula-mixins' }
 sourceSets.test.resources { srcDir 'build/gametest-resources' }
+sourceSets.test.java {
+    include '**/*Test.java'
+    include '**/ForgePortGameTests.java'
+    include '**/ForgeEffectsGameTests.java'
+    include '**/RealSpellFormulaHarness.java'
+    include '**/FormulaJarProbe.java'
+    include '**/DelegateFactoryParent.java'
+}
 
 def formulaSourceJar = layout.projectDirectory.file("libs/ironsspells-${ironsspells_version}.jar")
+def formulaSrgMinecraftJar = providers.gradleProperty('formulaSrgMinecraftJar').map { file(it) }.orElse(providers.provider {
+    new File(gradle.gradleUserHomeDir, "caches/forge_gradle/minecraft_user_repo/net/minecraftforge/forge/${minecraft_version}-${forge_version}/forge-${minecraft_version}-${forge_version}-srg.jar")
+})
 def formulaTargets = layout.buildDirectory.file('generated/formula-targets.json')
 def formulaCatalogTargets = layout.buildDirectory.file('generated/formula-catalog-targets.json')
 def formulaMixinSource = layout.buildDirectory.file('generated/formula-mixins/com/example/spell_compiler/mixin/formula/GeneratedSpellFormulaMixin.java')
-def formulaCatalog = layout.buildDirectory.file('generated/formula-resources/formula/ironsspells-3.16.1-catalog.json')
+def formulaCatalog = layout.buildDirectory.file('generated/formula-resources/formula/ironsspells-catalog.json')
 def formulaExtraTargets = ['ThunderstormEffect', 'FrostbiteEffect', 'GluttonyEffect', 'OakskinEffect', 'SpiderAspectEffect']
         .collect { "io.redspace.ironsspellbooks.effect.${it}".toString() }
 
+tasks.register('verifyLocalDependencies') {
+    doLast {
+        def required = [formulaSourceJar.asFile.name, "curios-${libs_version}.jar".toString()].toSet()
+        def manifest = new groovy.json.JsonSlurper().parse(file('dependencies.json'))
+        def entries = manifest.requiredRuntimeFiles
+        if (manifest.directory != 'libs' || !(entries instanceof List)
+                || entries.size() != required.size() || entries.collect { it.file }.toSet() != required)
+            throw new GradleException('Local dependency manifest does not match build.gradle. Check dependencies.json.')
+        entries.each { entry ->
+            def source = file("libs/${entry.file}")
+            if (!source.isFile())
+                throw new GradleException("Missing local dependency: ${entry.file}. See dependencies.json for the declared version and project sources.")
+            def digest = java.security.MessageDigest.getInstance('SHA-256')
+            new java.security.DigestInputStream(new FileInputStream(source), digest).withCloseable { input ->
+                input.transferTo(java.io.OutputStream.nullOutputStream())
+            }
+            def actual = java.util.HexFormat.of().formatHex(digest.digest())
+            if (actual != entry.sha256)
+                throw new GradleException("Local dependency checksum mismatch: ${entry.file}. Expected ${entry.sha256}, actual ${actual}.")
+        }
+    }
+}
+
 tasks.register('generateFormulaMixin') {
+    dependsOn('verifyLocalDependencies')
     inputs.file(formulaSourceJar)
     inputs.property('formulaSiteTargets', formulaExtraTargets)
     outputs.files(formulaTargets, formulaMixinSource)
@@ -58,9 +93,12 @@ tasks.register('generateFormulaMixin') {
         def targets
         new java.util.jar.JarFile(formulaSourceJar.asFile).withCloseable { jar ->
             targets = jar.stream().filter { entry ->
-                entry.name.startsWith('io/redspace/ironsspellbooks/spells/') &&
-                        entry.name.substring('io/redspace/ironsspellbooks/spells/'.length()).contains('/') &&
-                        entry.name.endsWith('.class') && !entry.name.contains('$')
+                entry.name.endsWith('.class') && !entry.name.contains('$') &&
+                        (entry.name.startsWith('io/redspace/ironsspellbooks/spells/') &&
+                                entry.name.substring('io/redspace/ironsspellbooks/spells/'.length()).contains('/') ||
+                                entry.name.startsWith('io/redspace/ironsspellbooks/entity/spells/') ||
+                                entry.name.startsWith('io/redspace/ironsspellbooks/entity/mobs/') ||
+                                entry.name.startsWith('io/redspace/ironsspellbooks/effect/'))
             }.map { entry -> entry.name.substring(0, entry.name.length() - 6).replace('/', '.') }.sorted().toList()
         }
         targets = (targets + formulaExtraTargets).unique().sort()
@@ -81,15 +119,57 @@ tasks.named('compileJava').configure { dependsOn('generateFormulaMixin') }
 tasks.register('generateFormulaCatalog', JavaExec) {
     dependsOn('compileJava')
     inputs.file(formulaSourceJar)
+    inputs.file(formulaSrgMinecraftJar)
     inputs.files(sourceSets.main.output.classesDirs)
+    inputs.file('src/main/resources/formula/binding-identities.json')
     outputs.files(formulaCatalog, formulaCatalogTargets)
-    classpath = sourceSets.main.output.classesDirs + configurations.runtimeClasspath
+    classpath = sourceSets.main.output.classesDirs + configurations.runtimeClasspath + files('src/main/resources')
     mainClass = 'com.example.spell_compiler.formula.FormulaCatalogGenerator'
     doFirst {
-        args = [formulaSourceJar.asFile.absolutePath, formulaCatalog.get().asFile.absolutePath, formulaCatalogTargets.get().asFile.absolutePath]
+        args = [formulaSourceJar.asFile.absolutePath, formulaCatalog.get().asFile.absolutePath,
+                formulaCatalogTargets.get().asFile.absolutePath, formulaSrgMinecraftJar.get().absolutePath]
     }
 }
 tasks.named('processResources').configure { dependsOn('generateFormulaCatalog') }
+
+def formulaMappedSourceJar = providers.provider {
+    def artifacts = configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts.findAll {
+        it.moduleVersion.id.group == 'libs' && it.name == 'ironsspells'
+    }
+    if (artifacts.size() != 1)
+        throw new GradleException("Expected exactly one resolved Iron's Spells runtime artifact, found ${artifacts.size()}")
+    artifacts.first().file
+}
+def formulaMappedCatalogDirectory = layout.buildDirectory.dir('gametest-resources/formula/catalogs')
+def formulaMappedCatalogTargets = layout.buildDirectory.file('generated/formula-mapped-catalog-targets.json')
+tasks.register('generateMappedFormulaCatalog', JavaExec) {
+    dependsOn('compileJava')
+    inputs.file(formulaMappedSourceJar)
+    inputs.files(sourceSets.main.output.classesDirs)
+    inputs.file('src/main/resources/formula/binding-identities.json')
+    outputs.dir(formulaMappedCatalogDirectory)
+    outputs.file(formulaMappedCatalogTargets)
+    classpath = sourceSets.main.output.classesDirs + configurations.runtimeClasspath + files('src/main/resources')
+    mainClass = 'com.example.spell_compiler.formula.FormulaCatalogGenerator'
+    doFirst {
+        def source = formulaMappedSourceJar.get()
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        new java.security.DigestInputStream(new FileInputStream(source), digest).withCloseable { input ->
+            input.transferTo(java.io.OutputStream.nullOutputStream())
+        }
+        def fingerprint = java.util.HexFormat.of().formatHex(digest.digest())
+        def catalog = new File(formulaMappedCatalogDirectory.get().asFile, "${fingerprint}.json")
+        args = [source.absolutePath, catalog.absolutePath, formulaMappedCatalogTargets.get().asFile.absolutePath]
+    }
+}
+tasks.matching { it.name == 'runGameTestServer' }.configureEach { dependsOn('generateMappedFormulaCatalog') }
+tasks.named('processTestResources').configure { mustRunAfter('generateMappedFormulaCatalog') }
+
+tasks.named('test', Test).configure {
+    systemProperty 'spell_compiler.srgMinecraftJar', formulaSrgMinecraftJar.get().absolutePath
+    if (providers.gradleProperty('formulaReleaseJar').isPresent())
+        systemProperty 'spell_compiler.releaseJar', file(providers.gradleProperty('formulaReleaseJar').get()).absolutePath
+}
 
 repositories {
     mavenCentral {
@@ -145,6 +225,7 @@ processResources {
 }
 
 jar {
+    from('LICENSE')
     manifest {
         attributes([
             'Specification-Title': mod_name,
@@ -160,10 +241,25 @@ jar {
 jar.finalizedBy('reobfJar')
 reobf { jarJar {} }
 tasks.named('jar').configure { archiveClassifier.set('slim') }
-tasks.named('jarJar').configure { archiveClassifier.set(''); finalizedBy('reobfJarJar') }
+tasks.named('jarJar').configure { archiveClassifier.set(''); from('LICENSE'); finalizedBy('reobfJarJar') }
 tasks.named('build').configure { dependsOn('jarJar') }
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
-tasks.named('test', Test).configure { useJUnitPlatform() }
+tasks.named('test', Test).configure {
+    maxHeapSize = '2g'
+    def liveFixturesRequested = providers.gradleProperty('formulaLiveFixtures').map { it.toBoolean() }.getOrElse(false)
+    inputs.property('formulaLiveFixturesRequested', liveFixturesRequested)
+    useJUnitPlatform { if (!liveFixturesRequested) excludeTags 'live-fixture' }
+    if (liveFixturesRequested) {
+        systemProperty 'spell_compiler.liveFixtureDir', providers.gradleProperty('formulaLiveFixtureDir')
+                .map { it.isBlank() ? '' : file(it).absolutePath }.getOrElse('')
+        systemProperty 'spell_compiler.liveBaselineJar', providers.gradleProperty('formulaLiveBaselineJar')
+                .map { it.isBlank() ? '' : file(it).absolutePath }.getOrElse('')
+    }
+    doFirst {
+        logger.lifecycle(liveFixturesRequested ? 'LIVE_FIXTURE_TESTS=REQUESTED'
+                : 'LIVE_FIXTURE_TESTS=NOT_REQUESTED (enable with -PformulaLiveFixtures=true -PformulaLiveFixtureDir=... -PformulaLiveBaselineJar=...)')
+    }
+}
 
 tasks.register('prepareGameTestTemplate') {
     def targets = ['spell_compiler', 'spell_compiler_formula', 'spell_compiler_formula_remote'].collect {

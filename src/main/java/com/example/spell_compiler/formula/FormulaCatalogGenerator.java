@@ -1,9 +1,7 @@
 package com.example.spell_compiler.formula;
 
-import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.*;
@@ -12,29 +10,20 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.jar.JarFile;
 
 public final class FormulaCatalogGenerator {
     private static final String SPELLS = "io/redspace/ironsspellbooks/spells/";
     private static final String ABSTRACT = "io/redspace/ironsspellbooks/api/spells/AbstractSpell";
     private static final String SPELL_REGISTRY = "io/redspace/ironsspellbooks/api/registry/SpellRegistry";
-    private static final String CONFIG = "io/redspace/ironsspellbooks/api/config/DefaultConfig";
-    private static final String SCHOOL_REGISTRY = "io/redspace/ironsspellbooks/api/registry/SchoolRegistry";
-    private static final String RARITY = "io/redspace/ironsspellbooks/api/spells/SpellRarity";
-    private static final String RESOURCE = "net/minecraft/resources/ResourceLocation";
-    private static final String MOD = "io/redspace/ironsspellbooks/IronsSpellbooks";
-    private static final String CONFIG_PARAMETER = "io/redspace/ironsspellbooks/api/config/SpellConfigParameter";
     private record InheritedMethod(String alias, String name, String descriptor) {}
     private static final List<InheritedMethod> INHERITED_METHODS = List.of(
             new InheritedMethod("spell_power", "getSpellPower", "(ILnet/minecraft/world/entity/Entity;)F"),
@@ -42,16 +31,12 @@ public final class FormulaCatalogGenerator {
             new InheritedMethod("cooldown_ticks", "getSpellCooldown", "()I"),
             new InheritedMethod("base_cast_time", "getCastTime", "(I)I"),
             new InheritedMethod("cast_time", "getEffectiveCastTime", "(ILnet/minecraft/world/entity/LivingEntity;)I"));
-    private static final Object UNKNOWN = new Object();
-    private static final Object THIS = new Object();
-    private static final List<String> PARAMETERS = List.of("baseManaCost", "manaCostPerLevel",
-            "baseSpellPower", "spellPowerPerLevel", "castTime");
-
     private FormulaCatalogGenerator() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 3) throw new IllegalArgumentException("Expected source JAR, catalog JSON and targets JSON");
-        JsonObject catalog = generate(Path.of(args[0]));
+        if (args.length != 3 && args.length != 4)
+            throw new IllegalArgumentException("Expected source JAR, catalog JSON, targets JSON and optional SRG Minecraft dependency JAR");
+        JsonObject catalog = args.length == 4 ? generate(Path.of(args[0]), Path.of(args[3])) : generate(Path.of(args[0]));
         JsonArray targets = new JsonArray();
         catalog.getAsJsonArray("spells").forEach(spell -> targets.add(spell.getAsJsonObject().get("className").getAsString()));
         write(Path.of(args[1]), catalog);
@@ -62,33 +47,41 @@ public final class FormulaCatalogGenerator {
 
     public static JsonObject generate(Path source) throws Exception {
         FormulaClassRepository repository = FormulaClassRepository.fromJar(source);
+        return generate(source, repository);
+    }
+
+    public static JsonObject generate(Path source, Path minecraftDependency) throws Exception {
+        var lookup = FormulaClassRepository.resourceLookup(List.of(minecraftDependency), FormulaCatalogGenerator.class.getClassLoader());
+        return generate(source, FormulaClassRepository.fromJar(source, lookup));
+    }
+
+    private static JsonObject generate(Path source, FormulaClassRepository repository) throws Exception {
         FormulaSites.validate(repository);
         FormulaConsumerSites.validate(repository);
-        String namespace = namespace(repository);
-        Map<String, Object> schoolResources = resourceFields(repository.classNode(SCHOOL_REGISTRY), namespace);
-        Map<String, Object> configDefaults = defaultConfig(repository.classNode(CONFIG));
-        Map<String, Double> multipliers = multiplierDefaults(repository.classNode(CONFIG_PARAMETER));
+        FormulaNumericSites.validate(repository);
+        FormulaEntitySites.validate(repository);
+        FormulaPublishedCorrections.validate(repository);
+        return generate(repository, repository.sourceClasses(), HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(Files.readAllBytes(source))));
+    }
+
+    static JsonObject generate(FormulaClassRepository repository, List<ClassNode> nativeSources, String sourceFingerprint) {
+        var metadata = new FormulaSpellMetadata(repository);
         Set<String> registeredClasses = registeredSpellClasses(repository);
         JsonObject catalog = new JsonObject();
-        catalog.addProperty("schemaVersion", 4);
-        catalog.addProperty("sourceSha256", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                .digest(Files.readAllBytes(source))));
+        catalog.addProperty("schemaVersion", 5);
+        catalog.addProperty("sourceSha256", sourceFingerprint);
         JsonArray spells = new JsonArray();
         JsonArray rejected = new JsonArray();
         JsonArray excluded = new JsonArray();
         JsonArray classErrors = new JsonArray();
         int scannedClasses = 0;
         int supportedMethods = 0;
-        try (JarFile jar = new JarFile(source.toFile())) {
-            List<ClassNode> sourceClasses = jar.stream().filter(entry -> entry.getName().endsWith(".class"))
-                    .map(entry -> repository.classNode(entry.getName().substring(0, entry.getName().length() - 6)))
-                    .toList();
-            FormulaUsage usage = new FormulaUsage(repository, sourceClasses);
-            for (var entry : jar.stream().filter(value -> value.getName().startsWith(SPELLS)
-                    && value.getName().substring(SPELLS.length()).contains("/")
-                    && value.getName().endsWith(".class") && !value.getName().contains("$"))
-                    .sorted(Comparator.comparing(java.util.jar.JarEntry::getName)).toList()) {
-                ClassNode owner = repository.classNode(entry.getName().substring(0, entry.getName().length() - 6));
+        {
+            FormulaUsage usage = new FormulaUsage(repository, repository.sourceClasses());
+            for (ClassNode owner : nativeSources.stream().filter(value -> value.name.startsWith(SPELLS)
+                    && value.name.substring(SPELLS.length()).contains("/") && !value.name.contains("$"))
+                    .sorted(Comparator.comparing(value -> value.name)).toList()) {
                 scannedClasses++;
                 if ((owner.access & Opcodes.ACC_ABSTRACT) != 0) {
                     exclude(excluded, owner, "abstract_class", "Abstract spell class has no registered instance");
@@ -104,9 +97,8 @@ public final class FormulaCatalogGenerator {
                 }
                 try {
                     String castType = AutomaticFormulaExtractor.nativeCastType(repository, owner.name);
-                    Map<String, Object> values = metadata(owner, schoolResources, configDefaults, namespace);
-                    JsonObject spell = metadataJson(owner, values, multipliers);
-                    extractSpell(repository, owner, spell, castType, usage, false, rejected);
+                    JsonObject spell = metadata.extract(owner);
+                    extractSpell(repository, owner, spell, castType, usage, !repository.baselineCoverage(), rejected);
                     supportedMethods += spell.getAsJsonArray("formulas").size();
                     spells.add(spell);
                 } catch (IllegalArgumentException failure) {
@@ -127,6 +119,27 @@ public final class FormulaCatalogGenerator {
 
     static void extractSpell(FormulaClassRepository repository, ClassNode owner, JsonObject spell,
                              String castType, FormulaUsage usage, boolean inheritedGetters, JsonArray rejected) {
+        JsonArray formulas = discoverFormulas(repository, owner, castType, inheritedGetters, rejected);
+        Set<String> reserved = new LinkedHashSet<>();
+        formulas.forEach(value -> reserved.add(value.getAsJsonObject().get("alias").getAsString()));
+        Set<FormulaDataFlow.MethodId> exposedMethods = new LinkedHashSet<>();
+        formulas.forEach(value -> {
+            var formula = value.getAsJsonObject();
+            exposedMethods.add(new FormulaDataFlow.MethodId(formula.get("declaringClass").getAsString(),
+                    formula.get("name").getAsString(), formula.get("descriptor").getAsString()));
+        });
+        var automatic = FormulaAutomaticSites.scan(repository, owner.name, reserved, exposedMethods);
+        FormulaAutomaticSites.register(automatic);
+        var graph = FormulaExecutionGraph.index(repository).analyze(owner.name);
+        JsonObject execution = FormulaCatalogEntries.execution(repository, owner.name, graph, automatic, exposedMethods);
+        spell.add("execution", execution);
+        automatic.sites().forEach(site -> formulas.add(FormulaCatalogEntries.automatic(site)));
+        publishFormulas(repository, owner, spell, formulas, graph, automatic, usage, inheritedGetters,
+                execution.getAsJsonArray("diagnostics"));
+    }
+
+    private static JsonArray discoverFormulas(FormulaClassRepository repository, ClassNode owner,
+                                             String castType, boolean inheritedGetters, JsonArray rejected) {
         JsonArray formulas = new JsonArray();
         Map<String, Integer> aliases = new HashMap<>();
         Set<String> selectedKeys = new LinkedHashSet<>();
@@ -140,7 +153,7 @@ public final class FormulaCatalogGenerator {
                     continue;
                 String key = method.name + method.desc;
                 if (!selectedKeys.add(key)) continue;
-                if (FormulaConsumerSites.excludedGetter(declaring.name, key)) {
+                if (repository.baselineCoverage() && FormulaConsumerSites.excludedGetter(declaring.name, key)) {
                     reject(rejected, owner, method, "Native numeric getter has no native effect consumer");
                     continue;
                 }
@@ -149,9 +162,9 @@ public final class FormulaCatalogGenerator {
                     reject(rejected, owner, method, analysis.rejection());
                     continue;
                 }
-                String baseAlias = alias(method.name, !inheritedGetters);
+                String baseAlias = alias(method.name, !inheritedGetters || owner.name.startsWith(SPELLS));
                 int count = aliases.merge(baseAlias, 1, Integer::sum);
-                formulas.add(formulaJson(count == 1 ? baseAlias : baseAlias + '_' + count,
+                formulas.add(FormulaCatalogEntries.method(count == 1 ? baseAlias : baseAlias + '_' + count,
                         declaring, method, analysis.formula(), castType));
             }
             if (!inheritedGetters) break;
@@ -165,11 +178,12 @@ public final class FormulaCatalogGenerator {
                 if (analysis.supported()) {
                     if (aliases.containsKey(selected.alias()))
                         throw new IllegalArgumentException("Inherited formula alias conflicts with a declared formula: " + selected.alias());
-                    formulas.add(formulaJson(selected.alias(), inherited.owner(), inherited.method(), analysis.formula(), castType));
+                    formulas.add(FormulaCatalogEntries.method(selected.alias(), inherited.owner(), inherited.method(), analysis.formula(), castType));
                 } else reject(rejected, owner, inherited.method(), analysis.rejection());
             }
         }
-        for (var site : FormulaSites.definitions(owner.name.replace('/', '.'))) {
+        for (var site : repository.baselineCoverage() ? FormulaSites.definitions(owner.name.replace('/', '.'))
+                : List.<FormulaSites.Definition>of()) {
             ClassNode valuesOwner = repository.classNode(site.declaringClass().replace('.', '/'));
             MethodNode valuesMethod = valuesOwner.methods.stream()
                     .filter(method -> method.name.equals(site.helperMethod()) && method.desc.equals(site.descriptor()))
@@ -179,51 +193,95 @@ public final class FormulaCatalogGenerator {
                 throw new IllegalArgumentException("内联数值公式无法提取：" + site.alias() + ": " + analysis.rejection());
             if (aliases.putIfAbsent(site.alias(), 1) != null)
                 throw new IllegalArgumentException("内联数值公式别名冲突：" + site.alias());
-            formulas.add(formulaJson(site.alias(), valuesOwner, valuesMethod, analysis.formula(), castType));
+            formulas.add(FormulaCatalogEntries.method(site.alias(), valuesOwner, valuesMethod, analysis.formula(), castType));
         }
+        var effectAttributes = FormulaEffectAttributeControls.register(repository, owner.name);
+        Set<String> attributeKeys = effectAttributes.stream().map(attribute -> attribute.numeric().key())
+                .collect(java.util.stream.Collectors.toSet());
+        var numeric = new ArrayList<FormulaNumericSites.Definition>();
+        if (repository.baselineCoverage()) {
+            numeric.addAll(FormulaNumericSites.definitions(owner.name.replace('/', '.')));
+            numeric.addAll(FormulaEntitySites.definitions(owner.name.replace('/', '.')));
+        }
+        FormulaAddonNumericSites.definitions(owner.name.replace('/', '.')).stream()
+                .filter(site -> !attributeKeys.contains(site.key())).forEach(numeric::add);
+        for (var site : numeric) {
+            if (aliases.putIfAbsent(site.alias(), 1) != null)
+                throw new IllegalArgumentException("消费数值公式别名冲突：" + site.alias());
+            formulas.add(FormulaCatalogEntries.numeric(site));
+        }
+        for (var attribute : effectAttributes) {
+            var site = attribute.numeric();
+            if (aliases.putIfAbsent(site.alias(), 1) != null)
+                throw new IllegalArgumentException("效果属性公式别名冲突：" + site.alias());
+            JsonObject formula = FormulaCatalogEntries.numeric(site);
+            formula.addProperty("strictExpression", "native_value");
+            formula.addProperty("readableExpression", "native_value");
+            formula.addProperty("unit", attribute.operation().equals("ADDITION") ? "attribute_value" : "percent");
+            formula.addProperty("consumptionFingerprint", "EFFECT_ATTRIBUTE:" + attribute.fingerprint());
+            formulas.add(formula);
+        }
+        return formulas;
+    }
+
+    private static void publishFormulas(FormulaClassRepository repository, ClassNode owner, JsonObject spell,
+                                        JsonArray formulas, FormulaExecutionGraph.Analysis graph,
+                                        FormulaAutomaticSites.Scan automatic, FormulaUsage usage,
+                                        boolean inheritedGetters, JsonArray diagnostics) {
         var consumers = usage.forSpell(owner.name);
         for (var value : formulas) {
             JsonObject formula = value.getAsJsonObject();
             String key = formula.get("name").getAsString() + formula.get("descriptor").getAsString();
             if (key.equals("getSpellPower(ILnet/minecraft/world/entity/Entity;)F") && !consumers.usesMethod(key))
                 formula.addProperty("editable", false);
+            if (owner.name.equals("io/redspace/ironsspellbooks/spells/evocation/ArrowVolleySpell")
+                    && key.equals("getCount(ILnet/minecraft/world/entity/LivingEntity;)I"))
+                formula.addProperty("editable", false);
+            if (owner.name.equals("org/xszb/interlace_spellweaves/spell/weaponSkill/GreatSwordStrike")
+                    && key.equals("getDamage(ILnet/minecraft/world/entity/LivingEntity;)I"))
+                formula.addProperty("editable", false);
         }
         JsonArray editableParameters = new JsonArray();
         for (String parameter : spell.getAsJsonObject("parameters").keySet()) {
-            if (inheritedGetters && PARAMETERS.contains(parameter) && !consumers.usesField(parameter)) continue;
+            if (inheritedGetters && FormulaSpellMetadata.BASE_PARAMETERS.contains(parameter) && !consumers.usesField(parameter)) continue;
             if ((parameter.equals("baseSpellPower") || parameter.equals("spellPowerPerLevel"))
                     && !consumers.usesField(parameter)) continue;
             editableParameters.add(parameter);
         }
         spell.add("editableParameters", editableParameters);
+        FormulaManaRatioBridge.registerGetters(repository, owner.name, formulas);
+        JsonArray damageComponents = new JsonArray();
+        var components = FormulaDamageComponents.analyze(repository, graph, automatic, formulas);
+        components.stream().flatMap(component -> component.evidence().stream())
+                .filter(evidence -> evidence.startsWith("UNRESOLVED_CONTROL_USE:")).distinct().sorted().forEach(diagnostics::add);
+        components.forEach(component -> damageComponents.add(component.toJson()));
+        FormulaDisplayControls.apply(repository, owner.name, formulas, components, diagnostics, formula -> {
+            String alias = formula.get("alias").getAsString();
+            String key = formula.get("name").getAsString() + formula.get("descriptor").getAsString();
+            return repository.baselineCoverage() && FormulaConsumerSites.definitions(owner.name.replace('/', '.')).stream()
+                    .anyMatch(definition -> definition.key().equals(key))
+                    || FormulaAttributeBridgeProof.verified(repository, owner.name, alias)
+                    || FormulaManaRatioBridge.hasVerifiedControl(repository, owner.name, alias);
+        });
+        spell.add("damageComponents", damageComponents);
+        JsonArray attributeComponents = new JsonArray();
+        var publishedKeys = new java.util.HashSet<String>();
+        for (var raw : formulas) {
+            var binding = raw.getAsJsonObject();
+            if (!binding.has("editable") || binding.get("editable").getAsBoolean())
+                publishedKeys.add(binding.get("name").getAsString() + binding.get("descriptor").getAsString());
+        }
+        FormulaEffectAttributeControls.components(repository, owner.name).stream().filter(component -> publishedKeys.contains(component.binding()))
+                .forEach(component -> attributeComponents.add(component.toJson()));
+        spell.add("attributeComponents", attributeComponents);
         spell.add("formulas", formulas);
-    }
-
-    private static JsonObject formulaJson(String alias, ClassNode declaringOwner, MethodNode method,
-                                          AutomaticFormulaExtractor.Formula extracted, String castType) {
-        JsonObject formula = new JsonObject();
-        formula.addProperty("alias", alias);
-        formula.addProperty("name", method.name);
-        formula.addProperty("descriptor", method.desc);
-        String key = method.name + method.desc;
-        boolean editable = !key.equals("getCastTime(I)I") && !key.equals("getSpellCooldown()I");
-        if (key.equals("getEffectiveCastTime(ILnet/minecraft/world/entity/LivingEntity;)I"))
-            editable = castType.equals("LONG") || castType.equals("CONTINUOUS");
-        formula.addProperty("editable", editable);
-        formula.addProperty("strictExpression", extracted.expression());
-        formula.addProperty("readableExpression", extracted.readableExpression());
-        JsonObject variables = new JsonObject();
-        extracted.variables().forEach((name, variable) -> variables.addProperty(name, variable.type().getDescriptor()));
-        formula.add("variables", variables);
-        formula.addProperty("declaringClass", declaringOwner.name.replace('/', '.'));
-        return formula;
     }
 
     public static Set<String> registeredSpellClasses(FormulaClassRepository repository) {
         ClassNode registry = repository.classNode(SPELL_REGISTRY);
         MethodNode initializer = registry.methods.stream().filter(method -> method.name.equals("<clinit>"))
                 .findFirst().orElseThrow();
-        List<AbstractInsnNode> instructions = executable(initializer);
+        List<AbstractInsnNode> instructions = FormulaAutomaticInjector.executable(initializer);
         Set<String> classes = new LinkedHashSet<>();
         for (int index = 0; index < instructions.size(); index++) {
             if (!(instructions.get(index) instanceof MethodInsnNode call) || !call.owner.equals(SPELL_REGISTRY)
@@ -244,203 +302,6 @@ public final class FormulaCatalogGenerator {
         return Set.copyOf(classes);
     }
 
-    private static JsonObject metadataJson(ClassNode owner, Map<String, Object> values, Map<String, Double> multipliers) {
-        String id = required(values, "spellId", String.class);
-        ConfigValue config = required(values, "defaultConfig", ConfigValue.class);
-        Map<String, Object> defaults = config.values;
-        String school = required(defaults, "schoolResource", String.class);
-        JsonObject spell = new JsonObject();
-        spell.addProperty("id", id);
-        spell.addProperty("className", owner.name.replace('/', '.'));
-        spell.addProperty("school", school);
-        JsonObject advanced = new JsonObject();
-        advanced.addProperty("enabled", required(defaults, "enabled", Number.class).intValue() != 0);
-        advanced.addProperty("max_level", required(defaults, "maxLevel", Number.class).intValue());
-        advanced.addProperty("min_rarity", required(defaults, "minRarity", String.class).toLowerCase(Locale.ROOT));
-        advanced.addProperty("allow_crafting", required(defaults, "allowCrafting", Number.class).intValue() != 0);
-        advanced.addProperty("school", school);
-        spell.add("advanced", advanced);
-        JsonObject parameters = new JsonObject();
-        for (String field : PARAMETERS) parameters.addProperty(field, required(values, field, Number.class).intValue());
-        parameters.addProperty("cooldown_in_seconds", required(defaults, "cooldownInSeconds", Number.class).doubleValue());
-        parameters.addProperty("power_multiplier", required(multipliers, "POWER_MULTIPLIER", Double.class));
-        parameters.addProperty("mana_cost_multiplier", required(multipliers, "MANA_MULTIPLIER", Double.class));
-        spell.add("parameters", parameters);
-        return spell;
-    }
-
-    private static Map<String, Object> metadata(ClassNode owner, Map<String, Object> schools,
-                                                Map<String, Object> configDefaults, String namespace) {
-        MethodNode constructor = owner.methods.stream().filter(method -> method.name.equals("<init>")
-                && method.desc.equals("()V")).findFirst().orElseThrow(() -> new IllegalArgumentException("No no-argument constructor"));
-        ArrayDeque<Object> stack = new ArrayDeque<>();
-        Map<Integer, Object> locals = new HashMap<>();
-        locals.put(0, THIS);
-        Map<String, Object> fields = new LinkedHashMap<>();
-        for (AbstractInsnNode instruction : constructor.instructions) {
-            int opcode = instruction.getOpcode();
-            if (opcode < 0) continue;
-            Object constant = constant(instruction);
-            if (constant != UNKNOWN) {
-                stack.push(constant);
-                continue;
-            }
-            switch (opcode) {
-                case Opcodes.NOP, Opcodes.RETURN -> {}
-                case Opcodes.ACONST_NULL -> stack.push(UNKNOWN);
-                case Opcodes.ALOAD, Opcodes.ILOAD, Opcodes.FLOAD, Opcodes.DLOAD, Opcodes.LLOAD ->
-                        stack.push(locals.getOrDefault(((VarInsnNode) instruction).var, UNKNOWN));
-                case Opcodes.ASTORE, Opcodes.ISTORE, Opcodes.FSTORE, Opcodes.DSTORE, Opcodes.LSTORE ->
-                        locals.put(((VarInsnNode) instruction).var, stack.pop());
-                case Opcodes.NEW -> stack.push(((TypeInsnNode) instruction).desc.equals(CONFIG)
-                        ? new ConfigValue(new LinkedHashMap<>(configDefaults)) : UNKNOWN);
-                case Opcodes.DUP -> stack.push(stack.peek());
-                case Opcodes.POP -> stack.pop();
-                case Opcodes.GETSTATIC -> {
-                    FieldInsnNode field = (FieldInsnNode) instruction;
-                    Object value = field.owner.equals(SCHOOL_REGISTRY) ? schools.getOrDefault(field.name, UNKNOWN)
-                            : field.owner.equals(RARITY) ? field.name : UNKNOWN;
-                    stack.push(value);
-                }
-                case Opcodes.PUTFIELD -> {
-                    FieldInsnNode field = (FieldInsnNode) instruction;
-                    Object value = stack.pop();
-                    Object receiver = stack.pop();
-                    if (receiver == THIS) fields.put(field.name, value);
-                }
-                case Opcodes.GETFIELD -> {
-                    FieldInsnNode field = (FieldInsnNode) instruction;
-                    stack.push(stack.pop() == THIS ? fields.getOrDefault(field.name, UNKNOWN) : UNKNOWN);
-                }
-                case Opcodes.CHECKCAST -> {}
-                case Opcodes.INVOKESTATIC, Opcodes.INVOKESPECIAL, Opcodes.INVOKEVIRTUAL, Opcodes.INVOKEINTERFACE -> {
-                    MethodInsnNode method = (MethodInsnNode) instruction;
-                    Object[] args = new Object[Type.getArgumentTypes(method.desc).length];
-                    for (int index = args.length - 1; index >= 0; index--) args[index] = stack.pop();
-                    Object receiver = opcode == Opcodes.INVOKESTATIC ? UNKNOWN : stack.pop();
-                    Object result = invocation(method, receiver, args, namespace);
-                    if (Type.getReturnType(method.desc).getSort() != Type.VOID) stack.push(result);
-                }
-                default -> throw new IllegalArgumentException("Unsupported constructor opcode " + opcode);
-            }
-        }
-        return fields;
-    }
-
-    private static Object invocation(MethodInsnNode method, Object receiver, Object[] args, String namespace) {
-        if (method.owner.equals(RESOURCE) && method.name.equals("fromNamespaceAndPath")
-                && args.length == 2 && args[0] instanceof String first && args[1] instanceof String second)
-            return first + ':' + second;
-        if (method.owner.equals(MOD) && method.name.equals("id") && args.length == 1 && args[0] instanceof String path)
-            return namespace + ':' + path;
-        if (method.owner.equals(CONFIG) && receiver instanceof ConfigValue config) {
-            String field = switch (method.name) {
-                case "setMinRarity" -> "minRarity";
-                case "setSchoolResource" -> "schoolResource";
-                case "setMaxLevel" -> "maxLevel";
-                case "setCooldownSeconds" -> "cooldownInSeconds";
-                case "setAllowCrafting" -> "allowCrafting";
-                case "setDeprecated" -> "enabled";
-                default -> null;
-            };
-            if (field != null && args.length == 1) {
-                Object value = args[0];
-                if (method.name.equals("setDeprecated"))
-                    value = value instanceof Number number ? (number.intValue() == 0 ? 1 : 0) : UNKNOWN;
-                config.values.put(field, value);
-                return config;
-            }
-            if (method.name.equals("build") && args.length == 0) return config;
-            if (method.name.equals("<init>") && args.length == 0) return UNKNOWN;
-            throw new IllegalArgumentException("Unsupported DefaultConfig invocation " + method.name + method.desc);
-        }
-        return UNKNOWN;
-    }
-
-    private static String namespace(FormulaClassRepository repository) {
-        ClassNode mod = repository.classNode(MOD);
-        MethodNode helper = mod.methods.stream().filter(method -> method.name.equals("id")
-                && method.desc.equals("(Ljava/lang/String;)L" + RESOURCE + ';')).findFirst().orElseThrow();
-        List<AbstractInsnNode> instructions = executable(helper);
-        if (instructions.size() != 4 || !(instructions.get(0) instanceof LdcInsnNode literal)
-                || !(literal.cst instanceof String result) || !(instructions.get(1) instanceof VarInsnNode load)
-                || load.getOpcode() != Opcodes.ALOAD || load.var != 0
-                || !(instructions.get(2) instanceof MethodInsnNode call) || !call.owner.equals(RESOURCE)
-                || !call.name.equals("fromNamespaceAndPath") || instructions.get(3).getOpcode() != Opcodes.ARETURN)
-            throw new IllegalArgumentException("Unrecognized native namespace helper");
-        return result;
-    }
-
-    private static Map<String, Object> resourceFields(ClassNode owner, String namespace) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        MethodNode initializer = owner.methods.stream().filter(method -> method.name.equals("<clinit>"))
-                .findFirst().orElseThrow();
-        List<AbstractInsnNode> instructions = executable(initializer);
-        for (int index = 2; index < instructions.size(); index++) {
-            if (!(instructions.get(index) instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.PUTSTATIC
-                    || !field.desc.equals('L' + RESOURCE + ';')) continue;
-            if (!(instructions.get(index - 1) instanceof MethodInsnNode call)) continue;
-            if (call.owner.equals(MOD) && call.name.equals("id") && constant(instructions.get(index - 2)) instanceof String path)
-                result.put(field.name, namespace + ':' + path);
-            else if (index >= 3 && call.owner.equals(RESOURCE) && call.name.equals("fromNamespaceAndPath")
-                    && constant(instructions.get(index - 3)) instanceof String first
-                    && constant(instructions.get(index - 2)) instanceof String second)
-                result.put(field.name, first + ':' + second);
-        }
-        return result;
-    }
-
-    private static Map<String, Object> defaultConfig(ClassNode owner) {
-        MethodNode constructor = owner.methods.stream().filter(method -> method.name.equals("<init>")
-                && method.desc.equals("()V")).findFirst().orElseThrow();
-        List<AbstractInsnNode> instructions = executable(constructor);
-        Map<String, Object> values = new LinkedHashMap<>();
-        for (int index = 2; index < instructions.size(); index++) {
-            if (instructions.get(index) instanceof FieldInsnNode field && field.getOpcode() == Opcodes.PUTFIELD
-                    && field.owner.equals(CONFIG) && instructions.get(index - 2) instanceof VarInsnNode load
-                    && load.getOpcode() == Opcodes.ALOAD && load.var == 0) {
-                Object value = constant(instructions.get(index - 1));
-                if (value != UNKNOWN) values.put(field.name, value);
-            }
-        }
-        return values;
-    }
-
-    private static Map<String, Double> multiplierDefaults(ClassNode owner) {
-        MethodNode initializer = owner.methods.stream().filter(method -> method.name.equals("<clinit>"))
-                .findFirst().orElseThrow();
-        List<AbstractInsnNode> instructions = executable(initializer);
-        Map<String, Double> values = new LinkedHashMap<>();
-        for (int index = 3; index < instructions.size(); index++) {
-            if (!(instructions.get(index) instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.PUTSTATIC
-                    || !Set.of("POWER_MULTIPLIER", "MANA_MULTIPLIER").contains(field.name)) continue;
-            if (instructions.get(index - 1) instanceof MethodInsnNode constructor && constructor.owner.equals(CONFIG_PARAMETER)
-                    && constructor.name.equals("<init>") && constructor.desc.endsWith("Ljava/lang/Object;)V")
-                    && instructions.get(index - 2) instanceof MethodInsnNode boxing && boxing.owner.equals("java/lang/Double")
-                    && boxing.name.equals("valueOf") && constant(instructions.get(index - 3)) instanceof Double value)
-                values.put(field.name, value);
-        }
-        return values;
-    }
-
-    private static Object constant(AbstractInsnNode instruction) {
-        int opcode = instruction.getOpcode();
-        if (opcode >= Opcodes.ICONST_M1 && opcode <= Opcodes.ICONST_5) return opcode - Opcodes.ICONST_0;
-        if (opcode >= Opcodes.LCONST_0 && opcode <= Opcodes.LCONST_1) return (long) (opcode - Opcodes.LCONST_0);
-        if (opcode >= Opcodes.FCONST_0 && opcode <= Opcodes.FCONST_2) return (float) (opcode - Opcodes.FCONST_0);
-        if (opcode >= Opcodes.DCONST_0 && opcode <= Opcodes.DCONST_1) return (double) (opcode - Opcodes.DCONST_0);
-        if (instruction instanceof LdcInsnNode literal && (literal.cst instanceof String || literal.cst instanceof Number))
-            return literal.cst;
-        if (instruction instanceof IntInsnNode push && (opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH)) return push.operand;
-        return UNKNOWN;
-    }
-
-    private static List<AbstractInsnNode> executable(MethodNode method) {
-        List<AbstractInsnNode> result = new ArrayList<>();
-        for (AbstractInsnNode instruction : method.instructions) if (instruction.getOpcode() >= 0) result.add(instruction);
-        return result;
-    }
-
     private static String alias(String method, boolean nativeAliases) {
         if (method.equals("getCastTime")) return "base_cast_time";
         if (method.equals("getEffectiveCastTime")) return "cast_time";
@@ -449,12 +310,6 @@ public final class FormulaCatalogGenerator {
         if (nativeAliases || name.equals("amplifier") || name.equals("amplifier_for_level") || name.endsWith("_amplifier"))
             return FormulaNames.alias(name);
         return name;
-    }
-
-    private static <T> T required(Map<String, ?> source, String name, Class<T> type) {
-        Object value = source.get(name);
-        if (!type.isInstance(value)) throw new IllegalArgumentException("Unresolved native default " + name);
-        return type.cast(value);
     }
 
     private static void reject(JsonArray rejected, ClassNode owner, MethodNode method, String reason) {
@@ -479,8 +334,7 @@ public final class FormulaCatalogGenerator {
     private static void write(Path path, com.google.gson.JsonElement value) throws IOException {
         Path target = path.toAbsolutePath();
         Files.createDirectories(target.getParent());
-        Files.writeString(target, new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create().toJson(value));
+        Files.writeString(target, SpellFormulaFiles.canonical(value), java.nio.charset.StandardCharsets.UTF_8);
     }
 
-    private record ConfigValue(Map<String, Object> values) {}
 }
