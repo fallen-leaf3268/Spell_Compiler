@@ -56,11 +56,7 @@ public final class FormulaCatalogGenerator {
     }
 
     private static JsonObject generate(Path source, FormulaClassRepository repository) throws Exception {
-        FormulaSites.validate(repository);
-        FormulaConsumerSites.validate(repository);
-        FormulaNumericSites.validate(repository);
-        FormulaEntitySites.validate(repository);
-        FormulaPublishedCorrections.validate(repository);
+        com.example.spell_compiler.formula.rules.FormulaNativeRules.validateBaseline(repository);
         return generate(repository, repository.sourceClasses(), HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                 .digest(Files.readAllBytes(source))));
     }
@@ -68,6 +64,8 @@ public final class FormulaCatalogGenerator {
     static JsonObject generate(FormulaClassRepository repository, List<ClassNode> nativeSources, String sourceFingerprint) {
         var metadata = new FormulaSpellMetadata(repository);
         Set<String> registeredClasses = registeredSpellClasses(repository);
+        FormulaEffectAttributeControls.beginCatalog(registeredClasses);
+        FormulaSourceControls.beginCatalog(registeredClasses);
         JsonObject catalog = new JsonObject();
         catalog.addProperty("schemaVersion", 5);
         catalog.addProperty("sourceSha256", sourceFingerprint);
@@ -114,6 +112,15 @@ public final class FormulaCatalogGenerator {
         catalog.addProperty("registeredSpells", registeredClasses.size());
         catalog.addProperty("supportedMethods", supportedMethods);
         catalog.addProperty("unsupportedMethods", rejected.size());
+        var ruleResults = new JsonArray();
+        for (var decision : com.example.spell_compiler.formula.rules.FormulaNativeRules.prepare(repository).decisions()) {
+            var result = new JsonObject();
+            result.addProperty("rule", decision.rule());
+            result.addProperty("available", decision.available());
+            if (!decision.reason().isEmpty()) result.addProperty("reason", decision.reason());
+            ruleResults.add(result);
+        }
+        catalog.add("bindingRules", ruleResults);
         return catalog;
     }
 
@@ -134,6 +141,18 @@ public final class FormulaCatalogGenerator {
         JsonObject execution = FormulaCatalogEntries.execution(repository, owner.name, graph, automatic, exposedMethods);
         spell.add("execution", execution);
         automatic.sites().forEach(site -> formulas.add(FormulaCatalogEntries.automatic(site)));
+        Set<String> publicAliases = new LinkedHashSet<>();
+        formulas.forEach(value -> publicAliases.add(value.getAsJsonObject().get("alias").getAsString()));
+        for (var control : FormulaSourceControls.register(repository, owner.name, automatic.sites())) {
+            var site = control.numeric();
+            if (!publicAliases.add(site.alias()))
+                throw new IllegalArgumentException("来源消费公式别名冲突：" + site.alias());
+            var formula = FormulaCatalogEntries.numeric(site);
+            formula.addProperty("strictExpression", "native_value");
+            formula.addProperty("readableExpression", "native_value");
+            formula.addProperty("consumptionFingerprint", control.fingerprint());
+            formulas.add(formula);
+        }
         publishFormulas(repository, owner, spell, formulas, graph, automatic, usage, inheritedGetters,
                 execution.getAsJsonArray("diagnostics"));
     }

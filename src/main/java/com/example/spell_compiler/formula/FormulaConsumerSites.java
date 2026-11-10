@@ -26,7 +26,12 @@ public final class FormulaConsumerSites {
     }
 
     private record Rule(String owner, String method, String descriptor, Kind kind, String alias,
-                        String calledOwner, String calledMethod, int instanceSlot, float divisor) {}
+                        String calledOwner, String calledMethod, int instanceSlot, float divisor, String effectId) {
+        Rule(String owner, String method, String descriptor, Kind kind, String alias,
+             String calledOwner, String calledMethod, int instanceSlot, float divisor) {
+            this(owner, method, descriptor, kind, alias, calledOwner, calledMethod, instanceSlot, divisor, "");
+        }
+    }
     private record Selected(MethodNode method, Rule rule, AbstractInsnNode point, AbstractInsnNode input) {}
     private enum Kind { CAPTURE, CALL, PRODUCT, SPIDER_PRODUCT }
 
@@ -61,6 +66,15 @@ public final class FormulaConsumerSites {
             }));
 
     private FormulaConsumerSites() {}
+
+    public static Set<String> requiredRuleOwners(String dispatchKey) {
+        var definition = DEFINITIONS.stream().filter(value -> value.dispatchKey().equals(dispatchKey)).findFirst().orElse(null);
+        if (definition == null || ATTRIBUTE_ALIASES.contains(definition.alias())) return Set.of();
+        return RULES.stream().filter(rule -> rule.kind() == Kind.CAPTURE
+                        ? rule.owner().equals(definition.spellClassName())
+                        : rule.effectId().equals(definition.effectId()) && definition.alias().equals(rule.alias()))
+                .map(Rule::owner).collect(Collectors.toUnmodifiableSet());
+    }
 
     private record EffectIndex(List<Definition> dynamic,
                                Map<String, List<FormulaEffectAttributeControls.Definition>> attributes,
@@ -276,19 +290,19 @@ public final class FormulaConsumerSites {
             result.add(new Rule(owner, "onCast", ON_CAST, Kind.CAPTURE, null, null, null, -1, 1));
         result.add(new Rule(EFFECTS + "FrostbiteEffect", "handleFrostbiteDeathEffects",
                 "(Lnet/minecraftforge/event/entity/living/LivingDeathEvent;)V", Kind.CALL, "damage",
-                EFFECTS + "FrostbiteEffect", "getDamageForAmplifier", 4, 1));
+                EFFECTS + "FrostbiteEffect", "getDamageForAmplifier", 4, 1, "irons_spellbooks:frostbite"));
         result.add(new Rule(EFFECTS + "GluttonyEffect", "finishEating",
                 "(Lnet/minecraftforge/event/entity/living/LivingEntityUseItemEvent$Finish;)V", Kind.PRODUCT, "mana_ratio",
-                EFFECTS + "GluttonyEffect", "ratioForAmplifier", 3, 1));
+                EFFECTS + "GluttonyEffect", "ratioForAmplifier", 3, 1, "irons_spellbooks:gluttony"));
         result.add(new Rule(EFFECTS + "OakskinEffect", "reduceDamage",
                 "(Lnet/minecraftforge/event/entity/living/LivingHurtEvent;)V", Kind.PRODUCT, "percent_damage",
-                EFFECTS + "OakskinEffect", "getReductionAmount", 2, 100));
+                EFFECTS + "OakskinEffect", "getReductionAmount", 2, 100, "irons_spellbooks:oakskin"));
         result.add(new Rule(EFFECTS + "OakskinEffect", "getDescriptionLine",
                 "(Lnet/minecraft/world/effect/MobEffectInstance;)Lnet/minecraft/network/chat/Component;", Kind.CALL, "percent_damage",
-                EFFECTS + "OakskinEffect", "getReductionAmount", 1, 100));
+                EFFECTS + "OakskinEffect", "getReductionAmount", 1, 100, "irons_spellbooks:oakskin"));
         result.add(new Rule(EFFECTS + "SpiderAspectEffect", "increaseDamage",
                 "(Lnet/minecraftforge/event/entity/living/LivingDamageEvent;)V", Kind.SPIDER_PRODUCT, "percent_damage",
-                null, null, 2, 100));
+                null, null, 2, 100, "irons_spellbooks:spider_aspect"));
         return List.copyOf(result);
     }
 

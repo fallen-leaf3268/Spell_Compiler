@@ -14,6 +14,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraftforge.event.entity.living.LivingEvent;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -26,6 +27,76 @@ public final class FormulaEntityContext {
     private static final Set<String> FAILURES = ConcurrentHashMap.newKeySet();
 
     private FormulaEntityContext() {}
+
+    private record Source(Entity host, CompoundTag data) {}
+
+    private static Source source(Object carrier, String spellClass) {
+        return source(carrier, data -> data.getString("class").equals(spellClass));
+    }
+
+    private static Source source(Object carrier, java.util.function.Predicate<CompoundTag> matches) {
+        Entity host = carrier instanceof Entity entity ? entity
+                : carrier instanceof LivingEvent event ? event.getEntity() : null;
+        if (host == null || host.level().isClientSide) return null;
+        CompoundTag direct = host.getPersistentData().getCompound(DATA_KEY);
+        if (valid(direct) && matches.test(direct)) return new Source(host, direct);
+        Source selected = null;
+        if (host instanceof LivingEntity living) for (MobEffectInstance effect : living.getActiveEffects()) {
+            if (!(effect instanceof FormulaSourceCarrier context) || !context.apoth$hasFormulaSource()) continue;
+            CompoundTag data = context.apoth$getFormulaSource();
+            if (valid(data) && matches.test(data)) {
+                if (selected != null && !selected.data().equals(data)) return null;
+                selected = new Source(host, data);
+            }
+        }
+        return selected;
+    }
+
+    static int sourceLevel(Object carrier, String spellClass) {
+        Source source = source(carrier, spellClass);
+        return source == null ? -1 : source.data().getInt("level");
+    }
+
+    static boolean active(String key, Object carrier) {
+        var anchor = FormulaAutomaticSites.find(key);
+        if (anchor == null) return false;
+        Source source = source(carrier, data -> FormulaAutomaticSites.findForSpell(data.getString("class"), anchor) != null);
+        if (source == null) return false;
+        var selected = FormulaAutomaticSites.findForSpell(source.data().getString("class"), anchor);
+        return selected != null && FormulaRuntimeDispatcher.isActive(selected.definition().dispatchKey(), source.host());
+    }
+
+    public static boolean enterEffectTick(Object instance, Object holder) {
+        return enterEffectTick(instance instanceof FormulaSourceCarrier carrier && carrier.apoth$hasFormulaSource()
+                ? carrier.apoth$getFormulaSource() : null, holder);
+    }
+
+    public static boolean enterEffectTick(CompoundTag data, Object holder) {
+        if (data != null && !data.isEmpty() && holder instanceof LivingEntity entity
+                && entity.level() instanceof ServerLevel level
+                && FormulaRuntimeDispatcher.hasActiveOwner(data.getString("class"), holder)) {
+            ResourceLocation id = ResourceLocation.tryParse(data.getString("spell"));
+            if (valid(data, id)) {
+                AbstractSpell spell = SpellRegistry.REGISTRY.get().getValue(id);
+                if (spell != null && spell.getClass().getName().equals(data.getString("class"))) {
+                    FormulaCastContext.enter(spell, data.getInt("level"), caster(level, data));
+                    return true;
+                }
+            }
+        }
+        var current = FormulaCastContext.peek();
+        if (current == null || current.spell() == null
+                || !FormulaRuntimeDispatcher.hasActiveOwner(current.spell().getClass().getName(), current.caster())) return false;
+        FormulaCastContext.enterDisabled();
+        return true;
+    }
+
+    private static Entity caster(ServerLevel level, CompoundTag data) {
+        ResourceLocation dimension = ResourceLocation.tryParse(data.getString("dimension"));
+        if (dimension == null || !data.hasUUID("caster")) return null;
+        ServerLevel source = level.getServer().getLevel(ResourceKey.create(Registries.DIMENSION, dimension));
+        return source == null ? null : source.getEntity(data.getUUID("caster"));
+    }
 
     public static void captureScoped(Object created, String registryOwner, String registryField) {
         var frame = FormulaCastContext.peek();
@@ -58,6 +129,17 @@ public final class FormulaEntityContext {
     }
 
     public static void inherit(Object child, Object parent) {
+        if (child instanceof MobEffectInstance && child instanceof FormulaSourceCarrier effect
+                && parent instanceof Entity source && source.level() instanceof ServerLevel level) {
+            CompoundTag context = source.getPersistentData().getCompound(DATA_KEY);
+            if (!valid(context)) return;
+            effect.apoth$setFormulaSource(context);
+            var id = ResourceLocation.tryParse(context.getString("spell"));
+            var spell = SpellRegistry.REGISTRY.get().getValue(id);
+            if (spell != null && spell.getClass().getName().equals(context.getString("class")))
+                FormulaConsumerHooks.captureAttributes(child, spell, context.getInt("level"), caster(level, context));
+            return;
+        }
         if (!(child instanceof Entity entity) || entity.level().isClientSide
                 || parent instanceof Entity source && source.level().isClientSide) return;
         if (parent instanceof Entity source) {
@@ -171,25 +253,54 @@ public final class FormulaEntityContext {
     }
 
     private static Number evaluate(Number original, String key, Object carrier, Object[] inputs) {
-        if (!(carrier instanceof Entity entity) || !(entity.level() instanceof ServerLevel level)) return null;
-        CompoundTag context = entity.getPersistentData().getCompound(DATA_KEY);
-        ResourceLocation spellId = ResourceLocation.tryParse(context.getString("spell"));
-        if (!valid(context, spellId)) return null;
         var anchor = FormulaAutomaticSites.find(key);
         if (anchor == null) return null;
+        Source source = source(carrier, data -> FormulaAutomaticSites.findForSpell(data.getString("class"), anchor) != null);
+        if (source == null || !(source.host().level() instanceof ServerLevel level)) return null;
+        Entity entity = source.host();
+        CompoundTag context = source.data();
+        ResourceLocation spellId = ResourceLocation.tryParse(context.getString("spell"));
+        if (!valid(context, spellId)) return null;
         var site = FormulaAutomaticSites.findForSpell(context.getString("class"), anchor);
         if (site == null || !samePoint(anchor, site)) return null;
-        var invoker = FormulaRuntimeDispatcher.resolveActive(site.definition().dispatchKey(), entity);
+        return invokeSource(site.definition(), original, entity, context, inputs);
+    }
+
+    public static Number evaluateSource(FormulaNumericSites.Definition definition, Number original, Entity carrier) {
+        if (definition == null || carrier == null || !(carrier.level() instanceof ServerLevel)) return null;
+        CompoundTag context = carrier.getPersistentData().getCompound(DATA_KEY);
+        return invokeSource(definition, original, carrier, context, null);
+    }
+
+    public static Number evaluateCastSource(FormulaNumericSites.Definition definition, Number original,
+                                           Object declaredSpell, Object caster) {
+        var frame = FormulaCastContext.peek();
+        if (definition == null || frame == null || frame.spell() != declaredSpell || frame.caster() != caster
+                || frame.level() <= 0 || !(declaredSpell instanceof AbstractSpell)
+                || !(caster instanceof LivingEntity entity) || !(entity.level() instanceof ServerLevel)
+                || !declaredSpell.getClass().getName().equals(definition.spellClassName().replace('/', '.'))) return null;
+        return FormulaNumericHooks.evaluate(definition, original, declaredSpell, frame.level(), caster);
+    }
+
+    public static Number evaluateEffect(FormulaNumericSites.Definition definition, Number original,
+                                        Object instance, LivingEntity holder) {
+        if (definition == null || holder == null || !(holder.level() instanceof ServerLevel)
+                || !(instance instanceof MobEffectInstance) || !(instance instanceof FormulaSourceCarrier source)
+                || !source.apoth$hasFormulaSource()) return null;
+        return invokeSource(definition, original, holder, source.apoth$getFormulaSource(), null);
+    }
+
+    private static Number invokeSource(FormulaNumericSites.Definition definition, Number original, Entity entity,
+                                       CompoundTag context, Object[] inputs) {
+        if (!(entity.level() instanceof ServerLevel level) || !valid(context)
+                || !context.getString("class").equals(definition.spellClassName().replace('/', '.'))) return null;
+        ResourceLocation spellId = ResourceLocation.tryParse(context.getString("spell"));
+        var invoker = FormulaRuntimeDispatcher.resolveActive(definition.dispatchKey(), entity);
         if (invoker == null) return null;
         try {
             AbstractSpell spell = SpellRegistry.REGISTRY.get().getValue(spellId);
             if (spell == null || !spell.getClass().getName().equals(context.getString("class"))) return null;
-            Entity caster = null;
-            ResourceLocation dimension = ResourceLocation.tryParse(context.getString("dimension"));
-            if (dimension != null && context.hasUUID("caster")) {
-                ServerLevel sourceLevel = level.getServer().getLevel(ResourceKey.create(Registries.DIMENSION, dimension));
-                if (sourceLevel != null) caster = sourceLevel.getEntity(context.getUUID("caster"));
-            }
+            Entity caster = caster(level, context);
             Object[] arguments = inputs == null
                     ? new Object[]{original.doubleValue(), context.getInt("level"), context.getDouble("power"),
                     context.getDouble("school"), context.getDouble("multiplier"), spell, caster}
@@ -197,8 +308,8 @@ public final class FormulaEntityContext {
                     context.getDouble("school"), context.getDouble("multiplier"), spell, caster, inputs};
             return FormulaRuntimeDispatcher.invoke(invoker, null, arguments);
         } catch (RuntimeException | LinkageError failure) {
-            if (FAILURES.add(site.definition().dispatchKey()))
-                LOGGER.error("[SpellFormula] {} 无法读取实体施法来源，保留原生值", site.definition().dispatchKey(), failure);
+            if (FAILURES.add(definition.dispatchKey()))
+                LOGGER.error("[SpellFormula] {} 无法读取实体施法来源，保留原生值", definition.dispatchKey(), failure);
             return null;
         }
     }

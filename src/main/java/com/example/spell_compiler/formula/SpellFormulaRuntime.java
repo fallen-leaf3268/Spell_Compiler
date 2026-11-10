@@ -120,8 +120,13 @@ public final class SpellFormulaRuntime {
         var registry = SpellRegistry.REGISTRY.get();
         for (var spell : registry.getValues()) registeredSpells.put(registry.getKey(spell), spell);
         var current = SpellFormulaState.catalog();
+        var discovery = FormulaAddonDiscovery.current();
+        if (!FormulaLoadedCatalog.disabled() && discovery != null) {
+            FormulaSourceControls.initializeRuntime();
+            com.example.spell_compiler.formula.rules.FormulaNativeRules.initializeRuntime();
+        }
         var discovered = FormulaAddonCatalog.discover(current, registeredSpells,
-                FormulaAddonDiscovery.current(), FormulaMixinPlugin.hookedMethods(), FormulaMixinPlugin.automaticHooks());
+                discovery, FormulaMixinPlugin.hookedMethods(), FormulaMixinPlugin.automaticHooks());
         SpellFormulaState.replaceCatalog(discovered.catalog());
         FormulaRuntimeHooks.initialize(discovered.catalog());
         addonsInitialized = true;

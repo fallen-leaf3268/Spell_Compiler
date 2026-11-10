@@ -177,6 +177,11 @@ public final class FormulaNumericSites {
         return INDEX.find(dispatchKey);
     }
 
+    public static Set<String> requiredRuleOwners(String dispatchKey) {
+        return RULES.stream().filter(rule -> rule.definition().dispatchKey().equals(dispatchKey)).map(Rule::owner)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
     public static void validate(FormulaClassRepository repository) {
         for (String owner : targetClasses()) {
             ClassNode source = repository.classNode(owner.replace('.', '/'));

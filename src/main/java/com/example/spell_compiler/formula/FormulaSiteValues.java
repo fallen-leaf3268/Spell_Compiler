@@ -5,9 +5,15 @@ public final class FormulaSiteValues {
 
     public static int healingInterval() { return 10; }
 
+    public static int healingInterval(@FormulaInput("level") int level) { return 10; }
+
     public static int summonDuration(Object caster) { return 12000; }
 
+    public static int summonDuration(Object caster, @FormulaInput("level") int level) { return 12000; }
+
     public static int fireTicks() { return 60; }
+
+    public static int fireTicks(@FormulaInput("level") int level) { return 60; }
 
     public static float thunderstormDamage(@FormulaInput("effect_level") int amplifierForLevel,
                                            @FormulaInput("spell_power") float spellpower,
@@ -20,13 +26,26 @@ public final class FormulaSiteValues {
 
     public static int strikeInterval() { return 40; }
 
+    public static int strikeInterval(@FormulaInput("level") int level) { return 40; }
+
     public static int horizontalRange() { return 20; }
+
+    public static int horizontalRange(@FormulaInput("level") int level) { return 20; }
 
     public static double verticalRange() { return 12; }
 
+    public static double verticalRange(@FormulaInput("level") int level) { return 12; }
+
     public static float hasteRadius() { return 3; }
 
+    public static float hasteRadius(@FormulaInput("level") int level) { return 3; }
+
     public static float sacrificeHealthBonus(@FormulaInput("summon_health") float summonHealth) {
+        return summonHealth * 0.5f;
+    }
+
+    public static float sacrificeHealthBonus(@FormulaInput("summon_health") float summonHealth,
+                                            @FormulaInput("level") int level) {
         return summonHealth * 0.5f;
     }
 }

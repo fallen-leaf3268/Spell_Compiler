@@ -17,6 +17,8 @@ public final class FormulaCastContext {
     private static final String OWNER = "com/example/spell_compiler/formula/FormulaCastContext";
     private static final String ENTER = "(Ljava/lang/Object;ILjava/lang/Object;)V";
     private static final ThreadLocal<Frame> CURRENT = new ThreadLocal<>();
+    private static final ThreadLocal<GetterProjection> GETTER = new ThreadLocal<>();
+    private record GetterProjection(Frame frame, Object spell, Object target, String key, GetterProjection previous) {}
     private static final Map<String, List<Root>> ROOTS = new ConcurrentHashMap<>();
     private static final Set<Root> VERIFIED = ConcurrentHashMap.newKeySet();
 
@@ -43,11 +45,98 @@ public final class FormulaCastContext {
 
     public static void exit() {
         Frame current = CURRENT.get();
+        while (GETTER.get() != null && GETTER.get().frame() == current) restoreGetter(GETTER.get());
         if (current == null || current.previous() == null) CURRENT.remove();
         else CURRENT.set(current.previous());
     }
 
     public static Frame peek() { return CURRENT.get(); }
+
+    public static void insertAtBodyStart(MethodNode method, InsnList code) {
+        LabelNode start = scopeStart(method);
+        if (start == null) method.instructions.insert(code);
+        else method.instructions.insert(start, code);
+    }
+
+    public static void insertBeforeReturnCleanup(MethodNode method, AbstractInsnNode returning, InsnList code) {
+        AbstractInsnNode cleanup = previous(returning);
+        method.instructions.insertBefore(scopeStart(method) != null && call(cleanup, "exit", "()V") ? cleanup : returning, code);
+    }
+
+    private static LabelNode scopeStart(MethodNode method) {
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            AbstractInsnNode enter = previous(block.start);
+            if (block.type != null || !call(enter, "enter", ENTER) && !call(enter, "enterDisabled", "()V")) continue;
+            AbstractInsnNode cleanup = next(block.handler);
+            AbstractInsnNode throwing = next(cleanup);
+            if (call(cleanup, "exit", "()V") && throwing != null && throwing.getOpcode() == Opcodes.ATHROW) return block.start;
+        }
+        return null;
+    }
+
+    public static int requirePositiveLevel(int level) {
+        if (level <= 0) throw FormulaContextUnavailableException.missing();
+        return level;
+    }
+
+    public static int sourceLevel(String spellClass, Object carrier) {
+        Frame frame = CURRENT.get();
+        if (frame != null && frame.spell() != null && frame.spell().getClass().getName().equals(spellClass)
+                && frame.level() > 0 && (carrier == null || carrier == frame.caster())) return frame.level();
+        return FormulaEntityContext.sourceLevel(carrier, spellClass);
+    }
+
+    public static int requireLevel(Object spell, Object caster) {
+        return requirePositiveLevel(spell == null ? -1 : sourceLevel(spell.getClass().getName(), caster));
+    }
+
+    public static int requireProjectedLevel(Object spell, Object target, String key) {
+        GetterProjection projection = GETTER.get();
+        if (projection != null && projection.frame() == CURRENT.get() && projection.spell() == spell
+                && projection.target() == target && projection.key().equals(key)) return requirePositiveLevel(projection.frame().level());
+        return requireLevel(spell, target);
+    }
+
+    public static Object enterGetterProjection(Object spell, Object target, String key) {
+        Frame frame = CURRENT.get();
+        if (frame == null || frame.spell() != spell || spell == null || frame.caster() == null || frame.level() <= 0
+                || !FormulaRuntimeDispatcher.isActive(FormulaRuntimeDispatcher.key(spell.getClass().getName(), key), frame.caster())) return null;
+        GetterProjection projection = new GetterProjection(frame, spell, target, key, GETTER.get());
+        GETTER.set(projection);
+        return projection;
+    }
+
+    public static void exitGetterProjection(Object token) {
+        if (token instanceof GetterProjection projection && GETTER.get() == projection) restoreGetter(projection);
+    }
+
+    private static void restoreGetter(GetterProjection projection) {
+        if (projection.previous() == null) GETTER.remove(); else GETTER.set(projection.previous());
+    }
+
+    public static List<Root> contextualRoots(FormulaClassRepository repository, String owner) {
+        String normalized = owner.replace('.', '/');
+        String prefix = "(Lnet/minecraft/world/level/Level;ILnet/minecraft/world/entity/LivingEntity;";
+        Set<String> names = Set.of("onCast", "onServerCastTick", "onServerCastComplete", "onClientCast",
+                "onServerPreCast", "onClientPreCast", "checkPreCastConditions");
+        Set<Root> result = new java.util.LinkedHashSet<>();
+        var source = repository.classNode(normalized);
+        if (source == null || !repository.isSubtype(normalized, "io/redspace/ironsspellbooks/api/spells/AbstractSpell")) return List.of();
+        for (MethodNode method : source.methods) {
+            if (method.name.equals("getUniqueInfo")
+                    && method.desc.equals("(ILnet/minecraft/world/entity/LivingEntity;)Ljava/util/List;")
+                    && (method.access & (Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) == 0
+                    && FormulaAutomaticInjector.contextIntact(method, 2, 1, 0)) {
+                result.add(new Root(source.name, method.name, method.desc, FormulaAutomaticInjector.fingerprint(method), 2, 1, 0));
+                continue;
+            }
+            if (!names.contains(method.name) || !method.desc.startsWith(prefix)
+                    || (method.access & (Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0
+                    || !FormulaAutomaticInjector.contextIntact(method, 3, 2, 0)) continue;
+            result.add(new Root(source.name, method.name, method.desc, FormulaAutomaticInjector.fingerprint(method), 3, 2, 0));
+        }
+        return List.copyOf(result);
+    }
 
     public static int overrideInt(int original, String key) {
         Number value = evaluate(original, key);
@@ -116,6 +205,7 @@ public final class FormulaCastContext {
 
     public static Runnable prepareRoots(String owner, List<MethodNode> methods) {
         Map<MethodNode, Root> selected = new LinkedHashMap<>();
+        Map<MethodNode, Runnable> projections = new LinkedHashMap<>();
         for (Root root : roots(owner)) {
             var matching = methods.stream().filter(method -> method.name.equals(root.methodName())
                     && method.desc.equals(root.methodDescriptor())).toList();
@@ -127,8 +217,9 @@ public final class FormulaCastContext {
             validate(method, root);
             Root previous = selected.putIfAbsent(method, root);
             if (previous != null && !previous.equals(root)) throw new IllegalArgumentException("同一入口存在冲突作用域：" + root);
+            projections.put(method, FormulaContextualLevelProof.prepare(method, root));
         }
-        return () -> selected.forEach(FormulaCastContext::wrap);
+        return () -> selected.forEach((method, root) -> { projections.get(method).run(); wrap(method, root); });
     }
 
     private static void validate(MethodNode method, Root root) {
@@ -219,7 +310,7 @@ public final class FormulaCastContext {
         long enters = instructions.stream().filter(instruction -> call(instruction, "enter", ENTER)
                 || call(instruction, "enterDisabled", "()V")).count();
         if (enters != 1) return false;
-        return cleanupRetained(method, instructions, instructions.get(3));
+        return cleanupRetained(method, instructions, instructions.get(3)) && FormulaContextualLevelProof.retained(method, root);
     }
 
     private static boolean disabledRetained(MethodNode method, List<AbstractInsnNode> instructions) {

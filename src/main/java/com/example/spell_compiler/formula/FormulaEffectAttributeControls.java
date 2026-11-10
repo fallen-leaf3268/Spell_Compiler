@@ -76,6 +76,7 @@ public final class FormulaEffectAttributeControls {
     private record Index(Map<String, List<Definition>> bySpell, Map<String, List<Definition>> byEffect,
                          Map<String, Definition> byBinding) {}
     private static volatile Index registered = new Index(Map.of(), Map.of(), Map.of());
+    private static Set<String> catalogSpells = Set.of();
     private static final Map<MobEffect, Map<Attribute, Definition>> RUNTIME = new ConcurrentHashMap<>();
     private static final Map<String, String> FAILURES = new ConcurrentHashMap<>();
 
@@ -86,6 +87,26 @@ public final class FormulaEffectAttributeControls {
         var definitions = discover(repository, spell).definitions();
         Map<String, List<Definition>> updated = new LinkedHashMap<>(registered.bySpell());
         updated.put(spell, definitions);
+        publish(updated);
+        FormulaAddonNumericSites.registerDynamic(spell, definitions.stream().map(Definition::numeric).toList());
+        return definitions;
+    }
+
+    public static synchronized void beginCatalog(Set<String> spellClasses) {
+        Set<String> current = spellClasses.stream().map(name -> name.replace('/', '.')).collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Set<String> replaced = new HashSet<>(catalogSpells);
+        replaced.addAll(current);
+        Map<String, List<Definition>> updated = new LinkedHashMap<>(registered.bySpell());
+        for (String owner : replaced) {
+            updated.remove(owner);
+            FormulaAddonNumericSites.registerDynamic(owner, List.of());
+        }
+        FAILURES.keySet().removeIf(key -> replaced.stream().anyMatch(owner -> key.startsWith(owner + '#')));
+        publish(updated);
+        catalogSpells = current;
+    }
+
+    private static void publish(Map<String, List<Definition>> updated) {
         Map<String, List<Definition>> effects = new LinkedHashMap<>();
         Map<String, Definition> bindings = new LinkedHashMap<>();
         for (var entries : updated.values()) for (var definition : entries) {
@@ -94,9 +115,7 @@ public final class FormulaEffectAttributeControls {
         }
         effects.replaceAll((id, entries) -> List.copyOf(entries));
         registered = new Index(Map.copyOf(updated), Map.copyOf(effects), Map.copyOf(bindings));
-        FormulaAddonNumericSites.registerDynamic(spell, definitions.stream().map(Definition::numeric).toList());
         RUNTIME.clear();
-        return definitions;
     }
 
     public static List<Definition> definitions(String spellClassName) { return registered.bySpell().getOrDefault(spellClassName.replace('/', '.'), List.of()); }
@@ -123,7 +142,7 @@ public final class FormulaEffectAttributeControls {
             FAILURES.putIfAbsent(dispatchKey, "实际效果未注册：" + definition.effectId());
             return false;
         }
-        return runtime(effect).containsValue(definition);
+        return runtime(effect).values().stream().anyMatch(actual -> sameTemplate(actual, definition));
     }
     public static List<Definition> forEffect(String effectId) {
         return registered.byEffect().getOrDefault(effectId, List.of());
@@ -161,6 +180,9 @@ public final class FormulaEffectAttributeControls {
             }
             aliases.put(effect.registryOwner() + '#' + effect.registryField(), List.copyOf(controlled));
             if (covered) complete.add(effect.registryOwner() + '#' + effect.registryField());
+        }
+        for (var definition : instanceDefinitions(repository, spell)) {
+            if (proposed.stream().noneMatch(existing -> sameTemplate(existing, definition))) proposed.add(definition);
         }
         var counts = proposed.stream().collect(java.util.stream.Collectors.groupingBy(definition -> definition.numeric().alias(), java.util.stream.Collectors.counting()));
         for (var definition : proposed) if (counts.get(definition.numeric().alias()) != 1)
@@ -206,6 +228,16 @@ public final class FormulaEffectAttributeControls {
                     result.add(new FormulaAttributes.Component(key, alias, binding, registration.id(), attributeId,
                             template.modifier(), FormulaAttributes.Operation.fromNative(template.operation())));
             }
+        }
+        for (var definition : definitions) {
+            if (result.stream().anyMatch(component -> component.binding().equals(definition.numeric().key()))) continue;
+            String attributeId = FormulaAttributeRegistration.id(repository, definition.attributeOwner(), definition.attributeField());
+            var template = new Template(definition.attributeOwner(), definition.attributeField(), definition.attributeDescriptor(),
+                    definition.modifierId(), definition.operation(), definition.baseAmount());
+            String key = attributeKey(repository, template);
+            if (attributeId != null && ALIAS_PATTERN.matcher(key).matches())
+                result.add(new FormulaAttributes.Component(key, definition.numeric().alias(), definition.numeric().key(),
+                        definition.effectId(), attributeId, definition.modifierId(), FormulaAttributes.Operation.fromNative(definition.operation())));
         }
         var counts = result.stream().collect(java.util.stream.Collectors.groupingBy(FormulaAttributes.Component::key, java.util.stream.Collectors.counting()));
         var bindings = result.stream().collect(java.util.stream.Collectors.groupingBy(FormulaAttributes.Component::binding, java.util.stream.Collectors.counting()));
@@ -439,6 +471,54 @@ public final class FormulaEffectAttributeControls {
         } finally { path.remove(origin); }
     }
 
+    private static List<Definition> instanceDefinitions(FormulaClassRepository repository, String spell) {
+        var sources = FormulaEntityFlow.entityEffectPublications(repository, spell);
+        List<Definition> result = new ArrayList<>();
+        Set<String> effects = new HashSet<>();
+        for (var publication : sources.publications()) {
+            var effect = publication.effectLink();
+            if (!effects.add(effect.registryOwner() + '#' + effect.registryField())) continue;
+            var registration = registration(repository, effect);
+            if (registration == null) continue;
+            var templates = templates(repository, effect, registration);
+            if (templates == null) continue;
+            for (var template : templates) {
+                try { FormulaAttributes.Operation.fromNative(template.operation()); }
+                catch (IllegalArgumentException unsupported) { continue; }
+                String alias = "attribute_" + attributeKey(repository, template);
+                if (!ALIAS_PATTERN.matcher(alias).matches()) continue;
+                var numeric = new FormulaNumericSites.Definition(spell, alias,
+                        (float) FormulaAttributes.Operation.fromNative(template.operation()).fromRaw(template.amount()),
+                        FormulaNumericSites.ValueType.FLOAT, -Float.MAX_VALUE, Float.MAX_VALUE);
+                String proof = sources.publications().stream()
+                        .filter(source -> source.registryOwner().equals(effect.registryOwner()) && source.registryField().equals(effect.registryField()))
+                        .map(source -> source.capture().owner() + '#' + source.capture().methodName() + source.capture().methodDescriptor()
+                                + ':' + source.capture().publicationOrdinal() + ':' + source.capture().methodFingerprint())
+                        .sorted().collect(java.util.stream.Collectors.joining("|"));
+                String fingerprint = effect.registryOwner() + '#' + effect.registryField() + ':' + template.owner() + '#'
+                        + template.field() + ':' + template.descriptor() + ':' + template.modifier() + ':' + template.operation()
+                        + ':' + Double.toHexString(template.amount()) + ':' + registration.id() + ':' + registration.fingerprint() + ":INSTANCE:" + proof;
+                result.add(new Definition(numeric, registration.id(), effect.registryOwner(), effect.registryField(),
+                        template.owner(), template.field(), template.descriptor(), template.modifier(), template.operation(), template.amount(), fingerprint));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private static boolean sameTemplate(Definition left, Definition right) {
+        return left.effectId().equals(right.effectId()) && left.registryOwner().equals(right.registryOwner())
+                && left.registryField().equals(right.registryField()) && left.attributeOwner().equals(right.attributeOwner())
+                && left.attributeField().equals(right.attributeField()) && left.attributeDescriptor().equals(right.attributeDescriptor())
+                && left.modifierId().equals(right.modifierId()) && left.operation().equals(right.operation())
+                && Double.compare(left.baseAmount(), right.baseAmount()) == 0 && left.numeric().alias().equals(right.numeric().alias());
+    }
+
+    static Definition match(MobEffectInstance effect, Attribute attribute, AttributeModifier modifier, String spell) {
+        var actual = match(effect, attribute, modifier);
+        if (actual == null) return null;
+        return definitions(spell).stream().filter(candidate -> sameTemplate(candidate, actual)).findFirst().orElse(null);
+    }
+
     public static String alias(MobEffectInstance effect, Attribute attribute) {
         var definition = runtime(effect.getEffect()).get(attribute);
         return definition == null ? null : definition.numeric().alias();
@@ -447,7 +527,7 @@ public final class FormulaEffectAttributeControls {
     public static Attribute attribute(Definition definition) {
         var effect = BuiltInRegistries.MOB_EFFECT.getOptional(new net.minecraft.resources.ResourceLocation(definition.effectId())).orElse(null);
         if (effect == null) return null;
-        return runtime(effect).entrySet().stream().filter(entry -> entry.getValue().equals(definition)).map(Map.Entry::getKey).findFirst().orElse(null);
+        return runtime(effect).entrySet().stream().filter(entry -> sameTemplate(entry.getValue(), definition)).map(Map.Entry::getKey).findFirst().orElse(null);
     }
 
     static Definition match(MobEffectInstance effect, Attribute attribute, AttributeModifier modifier) {
@@ -479,7 +559,8 @@ public final class FormulaEffectAttributeControls {
                         if (!modifier.getId().toString().equals(definition.modifierId())
                                 || !modifier.getOperation().name().equals(definition.operation()) || !Double.isFinite(modifier.getAmount())) return;
                         matches[0]++;
-                        if (result.putIfAbsent(actual, definition) != null) conflicts.add(actual);
+                        var previous = result.putIfAbsent(actual, definition);
+                        if (previous != null && !sameTemplate(previous, definition)) conflicts.add(actual);
                     });
                     if (matches[0] != 1 || layers[0] != 1) {
                         result.keySet().stream().filter(actual -> actual == attribute).forEach(conflicts::add);

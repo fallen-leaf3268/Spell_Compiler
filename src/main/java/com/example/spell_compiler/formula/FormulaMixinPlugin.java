@@ -8,6 +8,8 @@ import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
+import com.example.spell_compiler.formula.rules.FormulaBindingPlan;
+import com.example.spell_compiler.formula.rules.FormulaNativeRules;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -28,6 +30,8 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
     private String mixinPackage;
     private String dynamicMixin;
     private Set<String> dynamicTargets = Set.of();
+    private FormulaClassRepository bindingSource;
+    private FormulaBindingPlan bindingPlan;
 
     public FormulaMixinPlugin() {}
 
@@ -63,6 +67,7 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
                     .map(method -> new FormulaDataFlow.MethodId(method.declaringClass(), method.name(), method.descriptor()))
                     .collect(java.util.stream.Collectors.toSet());
             try {
+                FormulaContextualLevelProof.registerBindings(repository, spell.className(), exposedMethods);
                 FormulaEffectAttributeControls.register(repository, spell.className());
                 var getters = new com.google.gson.JsonArray();
                 for (var method : spell.formulas()) {
@@ -74,7 +79,9 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
                     getters.add(getter);
                 }
                 FormulaManaRatioBridge.registerGetters(repository, spell.className(), getters);
-                FormulaAutomaticSites.register(FormulaAutomaticSites.scan(repository, spell.className(), reserved, exposedMethods));
+                var automatic = FormulaAutomaticSites.scan(repository, spell.className(), reserved, exposedMethods);
+                FormulaAutomaticSites.register(automatic);
+                FormulaSourceControls.register(repository, spell.className(), automatic.sites());
             } catch (RuntimeException | LinkageError failure) {
                 LOGGER.warn("[SpellFormula] {} 无法扫描自动消费入口，保留既有入口", spell.className(), failure);
             }
@@ -97,6 +104,7 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
             addons.nativeSpellClasses().stream().map(name -> name.replace('/', '.')).forEach(names::add);
         FormulaAutomaticSites.targetClasses().stream().filter(name -> !targets.containsKey(name)).forEach(names::add);
         names.addAll(FormulaManaRatioBridge.targetClasses());
+        names.addAll(bindingPlan().targets());
         names.removeAll(targets.keySet());
         dynamicTargets = Set.copyOf(names);
     }
@@ -116,11 +124,7 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
                     .map(SpellFormulaCatalog.Method::key).toList());
             result.put(spell.className(), declared);
         }
-        FormulaSites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
-        FormulaConsumerSites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
-        FormulaNumericSites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
-        FormulaEntitySites.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
-        FormulaPublishedCorrections.targetClasses().forEach(target -> result.putIfAbsent(target, Set.of()));
+        FormulaNativeRules.baselineTargets().forEach(target -> result.putIfAbsent(target, Set.of()));
         return Map.copyOf(result);
     }
 
@@ -201,11 +205,7 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
         applyAutomatic(targetClassName, targetClass);
         FormulaDurationSites.apply(targetClass, definition);
         FormulaDirectPowerSites.apply(targetClass, definition);
-        FormulaSites.apply(targetClassName, targetClass);
-        FormulaConsumerSites.apply(targetClassName, targetClass);
-        FormulaNumericSites.apply(targetClassName, targetClass);
-        FormulaEntitySites.apply(targetClassName, targetClass);
-        FormulaPublishedCorrections.apply(targetClassName, targetClass);
+        applyRules(targetClassName, targetClass);
         List<MethodNode> updated = new ArrayList<>(targetClass.methods);
         var unmatched = new java.util.HashSet<>(selected);
         for (int index = 0; index < updated.size(); index++) {
@@ -233,6 +233,8 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
     @Override
     public void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {
         FormulaManaRatioBridge.verify(targetClassName, targetClass);
+        if (!FormulaExplosionBindings.verifyHook(targetClassName, targetClass))
+            LOGGER.warn("[SpellFormula] {} 爆炸来源挂钩未保留，隐藏关联的爆炸伤害公式", targetClassName);
         if (!FormulaEntityFlow.verifyCaptureHooks(targetClassName, targetClass))
             LOGGER.warn("[SpellFormula] {} 实体施法来源挂钩未保留，隐藏关联的实体公式", targetClassName);
         if (!FormulaCastContext.verifyRootHooks(targetClassName, targetClass))
@@ -248,6 +250,7 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
     private void applyAddon(String targetClassName, ClassNode targetClass) {
         if (addons == null) return;
         applyAutomatic(targetClassName, targetClass);
+        applyRules(targetClassName, targetClass);
         try {
             FormulaManaRatioBridge.apply(targetClassName, targetClass, addons.repository());
         } catch (RuntimeException | LinkageError failure) {
@@ -313,6 +316,28 @@ public final class FormulaMixinPlugin implements IMixinConfigPlugin {
             FormulaDamageTooltips.apply(target, definition, addons == null ? FormulaClassRepository.of(target) : addons.repository());
         } catch (RuntimeException | LinkageError failure) {
             LOGGER.warn("[SpellFormula] {} 无法确认伤害或属性说明来源，保留原生说明", target.name, failure);
+        }
+    }
+
+    private FormulaBindingPlan bindingPlan() {
+        FormulaClassRepository repository = addons.repository();
+        if (bindingPlan == null || bindingSource != repository) {
+            bindingPlan = FormulaNativeRules.prepare(repository);
+            FormulaNativeRules.install(bindingPlan);
+            bindingSource = repository;
+        }
+        return bindingPlan;
+    }
+
+    private void applyRules(String owner, ClassNode target) {
+        if (addons == null) {
+            FormulaNativeRules.applyBaseline(owner, target);
+            return;
+        }
+        for (var result : bindingPlan().apply(owner, target)) {
+            FormulaNativeRules.observe(result);
+            if (!result.available()) LOGGER.warn("[SpellFormula] {} 规则 {} 未接入，保留该分支原生行为：{}",
+                    owner, result.rule(), result.reason());
         }
     }
 

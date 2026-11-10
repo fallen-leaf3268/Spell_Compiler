@@ -77,10 +77,30 @@ final class FormulaExtractionInputs {
 
     Value parameter(String name, Type type, int slot) {
         if (variables.containsKey(name)) throw new Rejected("Duplicate formula parameter name: " + name);
-        List<AbstractInsnNode> code = List.of(new VarInsnNode(type.getOpcode(Opcodes.ILOAD), slot));
+        List<AbstractInsnNode> code = new ArrayList<>();
+        code.add(new VarInsnNode(type.getOpcode(Opcodes.ILOAD), slot));
+        if (name.equals("level") && rootOwner.name.equals("com/example/spell_compiler/formula/FormulaSiteValues"))
+            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "com/example/spell_compiler/formula/FormulaCastContext",
+                    "requirePositiveLevel", "(I)I", false));
         variables.put(name, new Variable(name, type, code));
         families.put(name, "parameter:" + slot);
         return new Value(type, new Input(type, name), code, null);
+    }
+
+    void contextualLevel(Value spell, Value caster) {
+        contextualLevel(spell, caster, false);
+    }
+
+    void contextualLevel(Value spell, Value caster, boolean owningRoot) {
+        if (variables.containsKey("level")) return;
+        List<AbstractInsnNode> code = new ArrayList<>(copyCode(spell.instructions()));
+        code.addAll(copyCode(caster.instructions()));
+        if (owningRoot) code.add(new LdcInsnNode(rootMethod.name + rootMethod.desc));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "com/example/spell_compiler/formula/FormulaCastContext",
+                owningRoot ? "requireProjectedLevel" : "requireLevel",
+                owningRoot ? "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;)I" : "(Ljava/lang/Object;Ljava/lang/Object;)I", false));
+        variables.put("level", new Variable("level", Type.INT_TYPE, code));
+        families.put("level", owningRoot ? "verified_owning_spell_root" : "verified_cast_source");
     }
 
     Value bind(String requested, Type type, List<AbstractInsnNode> code, String family) {

@@ -7,6 +7,9 @@ import com.example.spell_compiler.formula.FormulaConsumerHooks;
 import com.example.spell_compiler.formula.FormulaConsumerNetwork;
 import com.example.spell_compiler.formula.FormulaEntityContext;
 import com.example.spell_compiler.formula.FormulaSourceCarrier;
+import com.example.spell_compiler.formula.FormulaCastContext;
+import com.example.spell_compiler.formula.FormulaEffectPublicationControls;
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.llamalad7.mixinextras.sugar.Local;
@@ -69,6 +72,19 @@ public final class FormulaConsumerMixin {
         @Override
         public void apoth$setFormulaSource(CompoundTag source) {
             apoth$formulaSource = FormulaEntityContext.copySource(source);
+        }
+
+        @WrapMethod(method = "tick", require = 1)
+        private boolean apoth_formulaTickSource(LivingEntity holder, Runnable removed, Operation<Boolean> original) {
+            boolean entered = FormulaEntityContext.enterEffectTick(apoth$formulaSource, holder);
+            boolean effect = false;
+            try {
+                effect = FormulaEffectPublicationControls.enterTick(this, holder, apoth$formulaSource);
+                return original.call(holder, removed);
+            } finally {
+                if (effect) FormulaEffectPublicationControls.exitTick();
+                if (entered) FormulaCastContext.exit();
+            }
         }
 
         @Inject(method = "setDetailsFrom", at = @At("TAIL"), require = 1)

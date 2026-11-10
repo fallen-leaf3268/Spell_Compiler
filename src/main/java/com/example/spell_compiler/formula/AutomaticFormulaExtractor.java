@@ -175,6 +175,12 @@ public final class AutomaticFormulaExtractor {
                 if (!concrete.equals(rootOwner.name)) code.add(new TypeInsnNode(Opcodes.CHECKCAST, concrete));
                 receiver = new Value(Type.getObjectType(concrete), null, code, new Reference("this", "this", null, null));
             }
+            if (receiver != null && ints == 0 && repository.isSubtype(rootOwner.name, ABSTRACT_SPELL)) {
+                var casters = arguments.stream().filter(argument -> argument.type().getSort() == Type.OBJECT
+                        && repository.isSubtype(argument.type().getInternalName(), LIVING_ENTITY)).toList();
+                if (casters.size() == 1) inputs.contextualLevel(receiver, casters.get(0),
+                        FormulaContextualLevelProof.owningRoot(repository, rootOwner, rootMethod, receiverClass));
+            }
             return method(rootOwner, rootMethod, receiver, arguments);
         }
 

@@ -27,6 +27,7 @@ public final class FormulaFixedMixinPlugin implements IMixinConfigPlugin {
     private static final String UPDATE = '(' + EFFECT + 'Z' + ENTITY + ")V";
     private static final Map<String, String> DIAGNOSTICS = new ConcurrentHashMap<>();
     private final Function<String, ClassNode> classes;
+    private final Set<String> declinedMarkers = ConcurrentHashMap.newKeySet();
 
     public FormulaFixedMixinPlugin() { this(FormulaFixedMixinPlugin::read); }
     FormulaFixedMixinPlugin(Function<String, ClassNode> classes) { this.classes = classes; }
@@ -46,6 +47,19 @@ public final class FormulaFixedMixinPlugin implements IMixinConfigPlugin {
 
     @Override public void preApply(String targetClassName, ClassNode target, String mixinClassName, IMixinInfo info) {
         String problem = mismatch(targetClassName, mixinClassName, target);
+        if (mixinClassName.endsWith("FormulaPoisonMixin")) {
+            if (problem == null && FormulaEffectPublicationControls.applyPoisonTarget(target)) return;
+            declinedMarkers.add(mixinClassName);
+            FormulaEffectPublicationControls.observePoisonTarget(null);
+            unavailable(targetClassName, mixinClassName, problem == null ? "中毒伤害消费无法安全绑定" : problem);
+            return;
+        }
+        if (problem != null && mixinClassName.endsWith("FormulaLifestealMixin$Consumer")) {
+            declinedMarkers.add(mixinClassName);
+            FormulaLifestealControls.observeConsumerTarget(null);
+            unavailable(targetClassName, mixinClassName, problem);
+            return;
+        }
         if (problem != null) {
             String reason = "选定挂钩后目标又发生变化，无法安全撤回注入：" + problem;
             DIAGNOSTICS.put(mixinClassName, targetClassName + "：" + reason);
@@ -53,19 +67,33 @@ public final class FormulaFixedMixinPlugin implements IMixinConfigPlugin {
         }
     }
 
-    @Override public void postApply(String targetClassName, ClassNode target, String mixinClassName, IMixinInfo info) {}
+    @Override public void postApply(String targetClassName, ClassNode target, String mixinClassName, IMixinInfo info) {
+        if (declinedMarkers.contains(mixinClassName)) return;
+        if (mixinClassName.endsWith("FormulaPoisonMixin")) FormulaEffectPublicationControls.observePoisonTarget(target);
+        if (mixinClassName.endsWith("FormulaExplosionMixin")) FormulaExplosionBindings.observeExplosionTarget(target);
+        if (mixinClassName.endsWith("FormulaLifestealMixin")) FormulaLifestealControls.observeSourceTarget(target);
+        if (mixinClassName.endsWith("FormulaLifestealMixin$Consumer")) FormulaLifestealControls.observeConsumerTarget(target);
+    }
 
     public static Map<String, String> diagnostics() { return Map.copyOf(DIAGNOSTICS); }
 
     private static boolean unavailable(String target, String mixin, String problem) {
         String message = target + "：" + problem;
-        if (!optional(mixin)) {
+        if (!optional(mixin) && !optionalSource(mixin)) {
             DIAGNOSTICS.put(mixin, message);
             throw new IllegalStateException("[SpellFormula] 核心公式/效果载体接口不兼容，无法安全启用：" + mixin + " -> " + message);
         }
-        if (!message.equals(DIAGNOSTICS.put(mixin, message)))
-            LOGGER.warn("[SpellFormula] 可选显示挂钩 {} 不可用，仅关闭该显示增强：{}", mixin, message);
+        if (!message.equals(DIAGNOSTICS.put(mixin, message))) {
+            if (optionalSource(mixin))
+                LOGGER.warn("[SpellFormula] 来源公式挂钩 {} 不可用，保留该消费者原生行为：{}", mixin, message);
+            else LOGGER.warn("[SpellFormula] 可选显示挂钩 {} 不可用，仅关闭该显示增强：{}", mixin, message);
+        }
         return false;
+    }
+
+    private static boolean optionalSource(String mixin) {
+        return mixin.endsWith("FormulaPoisonMixin") || mixin.endsWith("FormulaExplosionMixin")
+                || mixin.endsWith("FormulaLifestealMixin") || mixin.endsWith("FormulaLifestealMixin$Consumer");
     }
 
     private static boolean optional(String mixin) {
@@ -110,6 +138,15 @@ public final class FormulaFixedMixinPlugin implements IMixinConfigPlugin {
                     calls(node, matching.get(0), "io/redspace/ironsspellbooks/api/util/Utils", "timeFromTicks",
                             "(FI)Ljava/lang/String;", 1, -1);
                 }
+            } else if (mixin.endsWith("FormulaLifestealMixin")) {
+                require(FormulaLifestealControls.validateSourceTarget(node), "原生吸血属性读取结构不匹配");
+            } else if (mixin.endsWith("FormulaLifestealMixin$Consumer")) {
+                require(FormulaLifestealControls.validateConsumerTarget(node), "原生吸血实际治疗消费结构不匹配");
+            } else if (mixin.endsWith("FormulaExplosionMixin")) {
+                String problem = FormulaExplosionBindings.validateExplosionTarget(node);
+                require(problem == null, problem);
+            } else if (mixin.endsWith("FormulaPoisonMixin")) {
+                require(FormulaEffectPublicationControls.validatePoisonTarget(node), "原生中毒伤害消费结构不匹配");
             } else if (mixin.endsWith("FormulaConsumerMixin$EffectData")) {
                 field(node, "hiddenEffect", EFFECT);
                 field(node, "duration", "I");
