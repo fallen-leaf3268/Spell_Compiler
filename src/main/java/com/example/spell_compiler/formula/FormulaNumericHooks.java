@@ -49,6 +49,7 @@ public final class FormulaNumericHooks {
         var definition = FormulaNumericSites.find(dispatchKey);
         if (definition == null) definition = FormulaEntitySites.find(dispatchKey);
         if (definition == null) definition = FormulaAddonNumericSites.find(dispatchKey);
+        if (definition == null) definition = FormulaSourceControls.find(dispatchKey);
         var automatic = definition == null ? FormulaAutomaticSites.find(dispatchKey) : null;
         return automatic == null ? definition : automatic.definition();
     }

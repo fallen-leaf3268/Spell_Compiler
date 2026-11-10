@@ -18,13 +18,18 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 public final class FormulaEntitySites {
-    record Point(FormulaNumericSites.Definition definition, String entityClassName) {
+    record Point(FormulaNumericSites.Definition definition, String entityClassName, String publicationClassName, String consumerClassName) {
         String pointKey() { return entityClassName + '#' + definition.alias(); }
     }
 
     private enum Kind { CAPTURE, INHERIT, CONSTANT, FIELD }
     private record Rule(String owner, Set<String> methods, String descriptor, Kind kind,
-                        String key, int constant, int expectedCount, int occurrence) {}
+                        String key, int constant, int expectedCount, int occurrence, String childType) {
+        Rule(String owner, Set<String> methods, String descriptor, Kind kind,
+             String key, int constant, int expectedCount, int occurrence) {
+            this(owner, methods, descriptor, kind, key, constant, expectedCount, occurrence, "");
+        }
+    }
     private record Selected(MethodNode method, Rule rule, AbstractInsnNode point) {}
 
     private static final String SPELLS = "io.redspace.ironsspellbooks.spells.";
@@ -38,14 +43,14 @@ public final class FormulaEntitySites {
             point("eldritch.SculkTentaclesSpell", "void_tentacle.VoidTentacle", "attack_window_ticks", 280, 0),
             point("eldritch.SculkTentaclesSpell", "void_tentacle.VoidTentacle", "attack_interval_ticks", 20, 1),
             point("eldritch.SculkTentaclesSpell", "void_tentacle.VoidTentacle", "blindness_duration_ticks", 100, 0),
-            point("nature.PoisonArrowSpell", "poison_cloud.PoisonCloud", "cloud_duration_ticks", 200, 0),
-            point("nature.PoisonArrowSpell", "poison_cloud.PoisonCloud", "poison_duration_ticks", 120, 0),
-            point("nature.PoisonArrowSpell", "poison_cloud.PoisonCloud", "hit_interval_ticks", 10, 1),
-            point("nature.PoisonSplashSpell", "poison_cloud.PoisonCloud", "poison_duration_ticks", 120, 0),
-            point("nature.PoisonSplashSpell", "poison_cloud.PoisonCloud", "hit_interval_ticks", 10, 1),
-            point("fire.MagmaBombSpell", "magma_ball.FireField", "hit_interval_ticks", 10, 1),
-            point("fire.ScorchSpell", "magma_ball.FireField", "hit_interval_ticks", 10, 1),
-            point("nature.EarthquakeSpell", "EarthquakeAoe", "hit_interval_ticks", 25, 1));
+            publishedPoint("nature.PoisonArrowSpell", "poison_cloud.PoisonCloud", "cloud_duration_ticks", 200, 0, "poison_arrow.PoisonArrow", "AoeEntity"),
+            publishedPoint("nature.PoisonArrowSpell", "poison_cloud.PoisonCloud", "poison_duration_ticks", 120, 0, "poison_arrow.PoisonArrow", "poison_cloud.PoisonCloud"),
+            publishedPoint("nature.PoisonArrowSpell", "poison_cloud.PoisonCloud", "hit_interval_ticks", 10, 1, "poison_arrow.PoisonArrow", "AoeEntity"),
+            publishedPoint("nature.PoisonSplashSpell", "poison_cloud.PoisonCloud", "poison_duration_ticks", 120, 0, "poison_cloud.PoisonSplash", "poison_cloud.PoisonCloud"),
+            publishedPoint("nature.PoisonSplashSpell", "poison_cloud.PoisonCloud", "hit_interval_ticks", 10, 1, "poison_cloud.PoisonSplash", "AoeEntity"),
+            publishedPoint("fire.MagmaBombSpell", "magma_ball.FireField", "hit_interval_ticks", 10, 1, "magma_ball.FireBomb", "AoeEntity"),
+            publishedPoint("fire.ScorchSpell", "magma_ball.FireField", "hit_interval_ticks", 10, 1, "magma_ball.FireField", "AoeEntity"),
+            publishedPoint("nature.EarthquakeSpell", "EarthquakeAoe", "hit_interval_ticks", 25, 1, "EarthquakeAoe", "AoeEntity"));
     private static final List<Rule> RULES = rules();
     private static final FormulaNumericIndex INDEX = new FormulaNumericIndex(POINTS.stream().map(Point::definition).toList());
 
@@ -71,6 +76,40 @@ public final class FormulaEntitySites {
 
     public static FormulaNumericSites.Definition find(String dispatchKey) {
         return INDEX.find(dispatchKey);
+    }
+
+    public static Set<String> requiredRuleOwners(String dispatchKey) {
+        var point = POINTS.stream().filter(value -> value.definition().dispatchKey().equals(dispatchKey)).findFirst().orElse(null);
+        if (point == null) return Set.of();
+        Set<String> owners = new java.util.LinkedHashSet<>();
+        RULES.stream().filter(rule -> rule.kind() == Kind.CAPTURE && rule.owner().equals(point.definition().spellClassName()))
+                .map(Rule::owner).forEach(owners::add);
+        record Path(String entity, List<Rule> steps) {}
+        var pending = new java.util.ArrayDeque<Path>();
+        pending.add(new Path(point.publicationClassName(), List.of()));
+        Set<String> visited = new java.util.HashSet<>();
+        boolean reached = false;
+        while (!pending.isEmpty()) {
+            var path = pending.removeFirst();
+            if (!visited.add(path.entity())) continue;
+            if (path.entity().equals(point.entityClassName())) {
+                path.steps().stream().map(Rule::owner).forEach(owners::add);
+                reached = true;
+                break;
+            }
+            for (var rule : RULES) if (rule.kind() == Kind.INHERIT && rule.owner().equals(path.entity()) && !rule.childType().isEmpty()) {
+                var steps = new ArrayList<>(path.steps());
+                steps.add(rule);
+                pending.add(new Path(rule.childType(), List.copyOf(steps)));
+            }
+        }
+        if (!reached) throw new IllegalStateException("实体入口没有声明的来源继承链：" + point.pointKey());
+        var consumers = RULES.stream().filter(rule -> rule.owner().equals(point.consumerClassName())
+                && (rule.kind() == Kind.CONSTANT && point.pointKey().equals(rule.key())
+                || rule.kind() == Kind.FIELD && point.definition().alias().equals(rule.key()))).toList();
+        if (consumers.isEmpty()) throw new IllegalStateException("实体入口没有声明的数值消费：" + point.pointKey());
+        consumers.stream().map(Rule::owner).forEach(owners::add);
+        return Set.copyOf(owners);
     }
 
     public static Set<String> targetClasses() {
@@ -170,9 +209,9 @@ public final class FormulaEntitySites {
         List<Rule> result = new ArrayList<>();
         for (String owner : POINTS.stream().map(value -> value.definition().spellClassName()).distinct().toList())
             result.add(new Rule(owner, Set.of("onCast"), ON_CAST, Kind.CAPTURE, null, 0, 1, -1));
-        result.add(inherit("poison_arrow.PoisonArrow", "createPoisonCloud", "(Lnet/minecraft/world/phys/Vec3;)V"));
-        result.add(inherit("poison_cloud.PoisonSplash", "createPoisonCloud", "()V"));
-        result.add(inherit("magma_ball.FireBomb", "createFireField", "(Lnet/minecraft/world/phys/Vec3;)V"));
+        result.add(inherit("poison_arrow.PoisonArrow", "createPoisonCloud", "(Lnet/minecraft/world/phys/Vec3;)V", "poison_cloud.PoisonCloud"));
+        result.add(inherit("poison_cloud.PoisonSplash", "createPoisonCloud", "()V", "poison_cloud.PoisonCloud"));
+        result.add(inherit("magma_ball.FireBomb", "createFireField", "(Lnet/minecraft/world/phys/Vec3;)V", "magma_ball.FireField"));
         result.add(constant("ball_lightning.BallLightning", Set.of("canHitVictim"),
                 "(Lnet/minecraft/world/entity/Entity;)Z", "hit_interval_ticks", 10, 1, -1));
         result.add(constant("firefly_swarm.FireflySwarmProjectile", Set.of("customServerAiStep", "m_8024_"),
@@ -194,8 +233,8 @@ public final class FormulaEntitySites {
         return List.copyOf(result);
     }
 
-    private static Rule inherit(String entity, String method, String descriptor) {
-        return new Rule(ENTITIES + entity, Set.of(method), descriptor, Kind.INHERIT, null, 0, 1, -1);
+    private static Rule inherit(String entity, String method, String descriptor, String child) {
+        return new Rule(ENTITIES + entity, Set.of(method), descriptor, Kind.INHERIT, null, 0, 1, -1, ENTITIES + child);
     }
 
     private static Rule constant(String entity, Set<String> methods, String descriptor, String alias,
@@ -205,8 +244,13 @@ public final class FormulaEntitySites {
     }
 
     private static Point point(String spell, String entity, String alias, int value, int minimum) {
+        return publishedPoint(spell, entity, alias, value, minimum, entity, entity);
+    }
+
+    private static Point publishedPoint(String spell, String entity, String alias, int value, int minimum,
+                                        String publication, String consumer) {
         return new Point(new FormulaNumericSites.Definition(SPELLS + spell, alias, value,
-                FormulaNumericSites.ValueType.INT, minimum, Integer.MAX_VALUE), ENTITIES + entity);
+                FormulaNumericSites.ValueType.INT, minimum, Integer.MAX_VALUE), ENTITIES + entity, ENTITIES + publication, ENTITIES + consumer);
     }
 
     private static Integer integer(AbstractInsnNode instruction) {

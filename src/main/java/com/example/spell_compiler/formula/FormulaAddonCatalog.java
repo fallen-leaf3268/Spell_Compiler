@@ -39,9 +39,13 @@ final class FormulaAddonCatalog {
         if (FormulaLoadedCatalog.disabled()) return new Result(FormulaLoadedCatalog.unavailable(), List.of());
         if (discovery == null) {
             var retained = builtin.spells().stream().map(spell -> retain(spell,
-                    method -> method.consumptionFingerprint().isEmpty())).toList();
+                    method -> method.consumptionFingerprint().isEmpty()
+                            && com.example.spell_compiler.formula.rules.FormulaNativeRules.unavailableReason(
+                            FormulaRuntimeDispatcher.key(spell.className(), method.key())) == null)).toList();
             return new Result(new SpellFormulaCatalog(retained, builtin.sourceFingerprint(), builtin.analysisReports()), List.of());
         }
+        FormulaSourceControls.initializeRuntime();
+        com.example.spell_compiler.formula.rules.FormulaNativeRules.initializeRuntime();
         List<SpellFormulaFiles.Diagnostic> diagnostics = new ArrayList<>();
         Map<String, JsonObject> reports = new HashMap<>(builtin.analysisReports());
         Map<String, List<ResourceLocation>> identities = new HashMap<>();
@@ -58,11 +62,9 @@ final class FormulaAddonCatalog {
                 .filter(spell -> discovery.nativeSources().isEmpty()
                         || registered.entrySet().stream().anyMatch(entry -> entry.getKey().toString().equals(spell.id())
                         && entry.getValue().getClass().getName().equals(spell.className())))
-                .map(spell -> retain(spell, method -> method.consumptionFingerprint().startsWith("EFFECT_ATTRIBUTE:")
-                                ? attributeBinding(spell.className(), method.key(), method.consumptionFingerprint())
-                                : method.consumptionFingerprint().isEmpty()
+                .map(spell -> retain(spell, method -> method.consumptionFingerprint().isEmpty()
                                 ? discovery.repository().baselineCoverage() || hooked(spell.className(), method.declaringClass(), method.key(), hooked)
-                                : automaticHooked.contains(FormulaRuntimeDispatcher.key(spell.className(), method.key())))).toList());
+                                : retainedConsumer(spell.className(), method.key(), method.consumptionFingerprint(), automaticHooked))).toList());
         Set<String> existing = new HashSet<>();
         spells.forEach(spell -> existing.add(spell.id()));
         FormulaUsage usage = new FormulaUsage(discovery.repository(), discovery.sources());
@@ -91,9 +93,7 @@ final class FormulaAddonCatalog {
                     String key = method.get("name").getAsString() + method.get("descriptor").getAsString();
                     boolean automatic = method.has("consumptionFingerprint");
                     String fingerprint = automatic ? method.get("consumptionFingerprint").getAsString() : "";
-                    boolean retained = fingerprint.startsWith("EFFECT_ATTRIBUTE:")
-                            ? attributeBinding(className, key, fingerprint)
-                            : automatic ? automaticHooked.contains(FormulaRuntimeDispatcher.key(className, key))
+                    boolean retained = automatic ? retainedConsumer(className, key, fingerprint, automaticHooked)
                             : hooked(className, declaring, key, hooked);
                     if (retained) retainedBindings.add(key);
                     else diagnostics.add(diagnostic(id, "附属公式没有早期挂钩，保留原方法：" + declaring + '#' + key, null));
@@ -142,6 +142,12 @@ final class FormulaAddonCatalog {
         spells.removeIf(spell -> conflicting.contains(spell.id()));
         spells.replaceAll(spell -> retain(spell, method -> {
                     if (!method.consumptionFingerprint().isEmpty()) return true;
+                    String nativeRule = com.example.spell_compiler.formula.rules.FormulaNativeRules.unavailableReason(
+                            FormulaRuntimeDispatcher.key(spell.className(), method.key()));
+                    if (nativeRule != null) {
+                        diagnostics.add(diagnostic(ResourceLocation.parse(spell.id()), nativeRule, null));
+                        return false;
+                    }
                     String reason = FormulaMethodCompatibility.unavailableReason(method.declaringClass(), method.key());
                     if (reason == null) return true;
                     diagnostics.add(diagnostic(ResourceLocation.parse(spell.id()), reason, null));
@@ -199,6 +205,13 @@ final class FormulaAddonCatalog {
                 && FormulaEffectAttributeControls.definitions(spellClass).stream().anyMatch(definition ->
                 definition.numeric().key().equals(method) && fingerprint.equals("EFFECT_ATTRIBUTE:" + definition.fingerprint())
                         && FormulaEntityFlow.hasVerifiedEffectSource(spellClass, definition.registryOwner(), definition.registryField()));
+    }
+
+    private static boolean retainedConsumer(String spell, String method, String fingerprint, Set<String> automaticHooks) {
+        if (fingerprint.startsWith("EFFECT_ATTRIBUTE:")) return attributeBinding(spell, method, fingerprint);
+        String key = FormulaRuntimeDispatcher.key(spell, method);
+        if (FormulaSourceControls.find(key) != null) return FormulaSourceControls.availableBinding(spell, method, fingerprint);
+        return automaticHooks.contains(key);
     }
 
     private static void validateBaseFields(FormulaClassRepository repository, org.objectweb.asm.tree.ClassNode owner) {

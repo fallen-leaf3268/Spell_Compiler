@@ -28,11 +28,7 @@ public final class FormulaCapturedValues {
         var anchor = FormulaAutomaticSites.find(key);
         if (anchor == null) return false;
         if (anchor.contextMode() == FormulaAutomaticSites.ContextMode.ENTITY) {
-            if (!(carrier instanceof net.minecraft.world.entity.Entity entity)) return false;
-            var context = entity.getPersistentData().getCompound(FormulaEntityContext.DATA_KEY);
-            if (!FormulaEntityContext.valid(context)) return false;
-            var site = FormulaAutomaticSites.findForSpell(context.getString("class"), anchor);
-            return site != null && FormulaRuntimeDispatcher.isActive(site.definition().dispatchKey(), entity);
+            return FormulaEntityContext.active(key, carrier);
         }
         if (anchor.contextMode() == FormulaAutomaticSites.ContextMode.SCOPED) {
             var frame = FormulaCastContext.peek();

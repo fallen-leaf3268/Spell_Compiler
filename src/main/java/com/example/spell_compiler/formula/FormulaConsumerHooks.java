@@ -58,7 +58,7 @@ public final class FormulaConsumerHooks {
         if (configured != null) for (var component : configured.spell().attributeComponents())
             if (configured.attributes().containsKey(component.key())) configuredBindings.add(component.binding());
         effect.getEffect().value().createModifiers(effect.getAmplifier(), (attribute, modifier) -> {
-            var definition = FormulaEffectAttributeControls.match(effect, attribute, modifier);
+            var definition = FormulaEffectAttributeControls.match(effect, attribute, modifier, spell.getClass().getName());
             if (definition == null || !definitions.contains(definition)) return;
             if (configuredBindings.contains(definition.numeric().key())) return;
             var value = FormulaNumericHooks.evaluate(definition.numeric(), FormulaAttributes.Operation.fromNative(definition.operation()).fromRaw(modifier.amount()), spell, level, caster);

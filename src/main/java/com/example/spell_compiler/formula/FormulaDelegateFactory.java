@@ -127,11 +127,13 @@ public final class FormulaDelegateFactory {
                     && invoker instanceof CompiledInvoker compiled && !compiled.nativePower();
             var numericDefinition = numericDefinitions.get(key);
             var automatic = automaticSites.get(key);
-            boolean automaticDamage = configured && automatic != null
-                    && automatic.kind() == FormulaAutomaticSites.Kind.DAMAGE
-                    && !java.util.regex.Pattern.compile("\\bnative_value\\b").matcher(overrides.get(key)).find()
-                    && automatic.inputs().stream().noneMatch(input -> (input.nativePower() || input.powerUnknown())
-                    && Pattern.compile("\\b" + Pattern.quote(input.name()) + "\\b").matcher(overrides.get(key)).find());
+            boolean rawDamage = numericDefinition != null && FormulaSourceControls.damageInput(numericDefinition.dispatchKey())
+                    == FormulaSourceControls.DamageInput.RAW;
+            boolean automaticDamage = configured && (automatic != null && automatic.kind() == FormulaAutomaticSites.Kind.DAMAGE
+                    || numericDefinition != null && FormulaSourceControls.isDamage(numericDefinition.dispatchKey()))
+                    && (rawDamage || !java.util.regex.Pattern.compile("\\bnative_value\\b").matcher(overrides.get(key)).find())
+                    && (automatic == null || automatic.inputs().stream().noneMatch(input -> (input.nativePower() || input.powerUnknown())
+                    && Pattern.compile("\\b" + Pattern.quote(input.name()) + "\\b").matcher(overrides.get(key)).find()));
             checked.put(key, (receiver, arguments) -> {
                 Number value = invoker.invoke(receiver, arguments);
                 if (automaticDamage) value = finishDamage(value, receiver, arguments, owner, definition, binding);

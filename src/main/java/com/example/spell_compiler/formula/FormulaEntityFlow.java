@@ -43,7 +43,30 @@ public final class FormulaEntityFlow {
     private static final Map<String, List<Capture>> CAPTURES = new LinkedHashMap<>();
     private static final Map<String, Set<Capture>> VERIFIED = new LinkedHashMap<>();
 
-    public enum CaptureMode { ENTITY, EFFECT_SOURCE, EFFECT_SCOPED, EFFECT_EVENT, EFFECT_CALLBACK }
+    public enum CaptureMode { ENTITY, EFFECT_SOURCE, EFFECT_SCOPED, EFFECT_EVENT, EFFECT_CALLBACK, EFFECT_PARENT }
+
+    public record EntityEffectPublication(String spellClassName, String registryOwner, String registryField,
+                                          String registryDescriptor, Capture capture) {
+        public FormulaExecutionGraph.EffectLink effectLink() {
+            var method = new FormulaExecutionGraph.MethodId(capture.owner().replace('.', '/'),
+                    capture.methodName(), capture.methodDescriptor());
+            return new FormulaExecutionGraph.EffectLink(registryOwner, registryField, "", Set.of(method), Set.of(),
+                    Set.of(method), Set.of(spellClassName.replace('.', '/')), false);
+        }
+    }
+
+    public record EntityEffectSources(List<Capture> parentCaptures, List<EntityEffectPublication> publications,
+                                      List<String> diagnostics, List<FormulaExecutionGraph.MethodId> provenMethods) {
+        public EntityEffectSources {
+            parentCaptures = List.copyOf(parentCaptures);
+            publications = List.copyOf(publications);
+            diagnostics = List.copyOf(diagnostics);
+            provenMethods = List.copyOf(provenMethods);
+        }
+        public EntityEffectSources(List<Capture> parentCaptures, List<EntityEffectPublication> publications, List<String> diagnostics) {
+            this(parentCaptures, publications, diagnostics, List.of());
+        }
+    }
 
     public record Capture(String owner, String methodName, String methodDescriptor, int producerIndex,
                           String methodFingerprint, int casterSlot, int levelSlot, int spellSlot,
@@ -129,6 +152,79 @@ public final class FormulaEntityFlow {
     public static Result scan(FormulaClassRepository repository, String spell, Set<String> reserved,
                               List<FormulaAutomaticSites.Site> coveredSites) {
         return new FormulaEntityFlow(repository, spell, reserved, coveredSites).scan();
+    }
+
+    public static List<Capture> contextualEffectCaptures(FormulaClassRepository repository, String spell) {
+        var analysis = new FormulaEntityFlow(repository, spell, Set.of(), List.of());
+        var graph = FormulaExecutionGraph.analyze(repository, spell);
+        var roots = Set.copyOf(FormulaExecutionGraph.index(repository).synchronousExecutionHelpers(spell).roots());
+        List<Capture> result = new ArrayList<>();
+        for (var effect : graph.effects()) {
+            if (effect.ownershipComplete() && effect.spellClasses().equals(Set.of(graph.spellClass())))
+                result.addAll(analysis.effectSources(effect, roots));
+        }
+        return result.stream().distinct().toList();
+    }
+
+    public static EntityEffectSources entityEffectPublications(FormulaClassRepository repository, String spell) {
+        return new FormulaEntityFlow(repository, spell, Set.of(), List.of()).entityEffectSources();
+    }
+
+    private EntityEffectSources entityEffectSources() {
+        List<Capture> parents = new ArrayList<>();
+        for (var root : FormulaExecutionGraph.index(repository).synchronousExecutionHelpers(spell).roots().stream()
+                .sorted(Comparator.comparing(FormulaExecutionGraph.MethodId::key)).toList()) {
+            var resolved = repository.resolveMethod(root.owner(), root.name(), root.descriptor());
+            if (resolved == null || !rootContext(resolved.method())) continue;
+            Body body = new Body(resolved.owner().name, resolved.method());
+            Data data = data(body);
+            if (data == null) continue;
+            for (var instruction : body.method().instructions) {
+                if (!(instruction instanceof MethodInsnNode publication) || !spawn(publication)
+                        || !repository.isSubtype(publication.owner, LEVEL)) continue;
+                Object origin = data.origin(data.argument(publication, 0));
+                if (!(origin instanceof TypeInsnNode allocation) || allocation.getOpcode() != Opcodes.NEW
+                        || !repository.isSubtype(allocation.desc, ENTITY)) continue;
+                var descendants = descendants(allocation.desc,
+                        () -> FormulaInterproceduralFlow.inspectPublishedObject(repository, data.analysis, publication));
+                if (descendants.consumers().isEmpty()) continue;
+                parents.add(new Capture(body.owner(), body.method().name, body.method().desc,
+                        snapshot(body.method()).indexOf(publication), snapshot(body.method()).fingerprint(),
+                        3, 2, 0, allocation.desc, allocationOrdinal(body.method(), allocation),
+                        publicationOrdinal(body.method(), publication)));
+                parents.addAll(descendants.captures());
+            }
+        }
+        Set<String> provenParents = parents.stream().map(Capture::entityClassName)
+                .map(name -> name.replace('.', '/')).collect(java.util.stream.Collectors.toSet());
+        List<EntityEffectPublication> publications = new ArrayList<>();
+        for (Data data : bodies.values().stream().sorted(Comparator.comparing(value -> key(value.body))).toList()) {
+            Body body = data.body;
+            if ((body.method().access & (Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0
+                    || body.method().name.startsWith("<") || !FormulaAutomaticInjector.contextIntact(body.method(), 0)
+                    || provenParents.stream().noneMatch(parent -> repository.isSubtype(parent, body.owner()))) continue;
+            for (var instruction : body.method().instructions) {
+                if (!(instruction instanceof MethodInsnNode publication) || !simpleEffectPublication(publication)
+                        || !repository.isSubtype(publication.owner, LIVING) || !data.analysis.reachable(publication)) continue;
+                Object origin = data.origin(data.argument(publication, 0));
+                if (!(origin instanceof TypeInsnNode allocation) || allocation.getOpcode() != Opcodes.NEW
+                        || !allocation.desc.equals(INSTANCE)) continue;
+                Object holder = allocatedEffectHolder(data, allocation);
+                if (!(holder instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.GETSTATIC) continue;
+                var capture = new Capture(body.owner(), body.method().name, body.method().desc,
+                        snapshot(body.method()).indexOf(publication), snapshot(body.method()).fingerprint(),
+                        -1, -1, -1, INSTANCE, allocationOrdinal(body.method(), allocation),
+                        effectPublicationOrdinal(body.method(), publication), 0, CaptureMode.EFFECT_PARENT,
+                        field.owner, field.name, -1, field.desc);
+                publications.add(new EntityEffectPublication(spell, field.owner, field.name, field.desc, capture));
+            }
+        }
+        var methods = bodies.values().stream().map(data -> data.body).filter(body -> rootContext(body.method())
+                        || (body.method().access & Opcodes.ACC_STATIC) == 0
+                        && provenParents.stream().anyMatch(parent -> repository.isSubtype(parent, body.owner())))
+                .map(body -> new FormulaExecutionGraph.MethodId(body.owner(), body.method().name, body.method().desc))
+                .sorted(Comparator.comparing(FormulaExecutionGraph.MethodId::key)).distinct().toList();
+        return new EntityEffectSources(parents.stream().distinct().toList(), publications.stream().distinct().toList(), diagnostics, methods);
     }
 
     private Result scan() {
@@ -842,9 +938,11 @@ public final class FormulaEntityFlow {
     public static synchronized boolean hasVerifiedEffectSource(String spellClassName, String registryOwner, String registryField) {
         String owner = spellClassName.replace('/', '.');
         var captures = CAPTURES.getOrDefault(owner, List.of()).stream()
-                .filter(capture -> (capture.mode() == CaptureMode.EFFECT_SOURCE || capture.mode() == CaptureMode.EFFECT_SCOPED)
+                .filter(capture -> (capture.mode() == CaptureMode.EFFECT_SOURCE || capture.mode() == CaptureMode.EFFECT_SCOPED
+                        || capture.mode() == CaptureMode.EFFECT_PARENT)
                         && capture.registryOwner().equals(registryOwner.replace('.', '/')) && capture.registryField().equals(registryField)).toList();
         return !captures.isEmpty() && VERIFIED.getOrDefault(owner, Set.of()).containsAll(captures)
+                && (captures.stream().noneMatch(capture -> capture.mode() == CaptureMode.EFFECT_PARENT) || hasVerifiedSource(owner))
                 && (captures.stream().noneMatch(capture -> capture.mode() == CaptureMode.EFFECT_SCOPED)
                 || FormulaCastContext.hasVerifiedSource(owner));
     }
@@ -943,6 +1041,12 @@ public final class FormulaEntityFlow {
     }
 
     private static boolean captureContext(MethodNode method, Capture capture) {
+        if (capture.mode() == CaptureMode.EFFECT_PARENT)
+            return capture.parentSlot() == 0 && capture.spellSlot() == -1 && capture.levelSlot() == -1 && capture.casterSlot() == -1
+                    && capture.effectReadOrdinal() == -1 && capture.entityClassName().equals(INSTANCE.replace('/', '.'))
+                    && !capture.registryOwner().isBlank() && !capture.registryField().isBlank() && !capture.registryDescriptor().isBlank()
+                    && (method.access & (Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) == 0
+                    && !method.name.startsWith("<") && FormulaAutomaticInjector.contextIntact(method, 0);
         if (capture.mode() == CaptureMode.EFFECT_SCOPED)
             return capture.spellSlot() == -1 && capture.levelSlot() == -1 && capture.casterSlot() == -1
                     && capture.parentSlot() == -1 && capture.effectReadOrdinal() == -1
@@ -993,7 +1097,8 @@ public final class FormulaEntityFlow {
                 && instructions.get(next + 2) instanceof MethodInsnNode snapshot && snapshot.getOpcode() == Opcodes.INVOKESTATIC
                 && snapshot.owner.equals("com/example/spell_compiler/formula/FormulaEntityHooks") && snapshot.name.equals("inherit")
                 && snapshot.desc.equals("(Ljava/lang/Object;Ljava/lang/Object;)V")) next += 3;
-        return next < instructions.size() && instructions.get(next) instanceof MethodInsnNode publication && spawn(publication)
+        return next < instructions.size() && instructions.get(next) instanceof MethodInsnNode publication
+                && (spawn(publication) || simpleEffectPublication(publication))
                 ? publication : null;
     }
 
@@ -1033,7 +1138,7 @@ public final class FormulaEntityFlow {
             List<AbstractInsnNode> instructions = snapshot.instructions();
             if (capture.producerIndex() < 0 || capture.producerIndex() >= instructions.size()
                     || !(instructions.get(capture.producerIndex()) instanceof MethodInsnNode call)
-                    || !(capture.mode() == CaptureMode.EFFECT_SOURCE || capture.mode() == CaptureMode.EFFECT_SCOPED
+                    || !(capture.mode() == CaptureMode.EFFECT_SOURCE || capture.mode() == CaptureMode.EFFECT_SCOPED || capture.mode() == CaptureMode.EFFECT_PARENT
                     ? simpleEffectPublication(call) : spawn(call)))
                 throw mismatch(capture, "实体发布消费锚点已经变化");
             try {
@@ -1086,10 +1191,13 @@ public final class FormulaEntityFlow {
         if (!(origin instanceof TypeInsnNode allocation) || allocation.getOpcode() != Opcodes.NEW
                 || !allocation.desc.replace('/', '.').equals(capture.entityClassName())
                 || allocationOrdinal(data.body.method(), allocation) != capture.allocationOrdinal()) return false;
-        if (capture.mode() == CaptureMode.EFFECT_SOURCE || capture.mode() == CaptureMode.EFFECT_SCOPED)
+        if (capture.mode() == CaptureMode.EFFECT_SOURCE || capture.mode() == CaptureMode.EFFECT_SCOPED || capture.mode() == CaptureMode.EFFECT_PARENT)
             return simpleEffectPublication(publication) && data.repository.isSubtype(publication.owner, LIVING)
                     && effectPublicationOrdinal(data.body.method(), publication) == capture.publicationOrdinal()
-                    && holderMatches(allocatedEffectHolder(data, allocation), capture.registryOwner(), capture.registryField());
+                    && holderMatches(allocatedEffectHolder(data, allocation), capture.registryOwner(), capture.registryField())
+                    && (capture.mode() != CaptureMode.EFFECT_PARENT
+                    || allocatedEffectHolder(data, allocation) instanceof FieldInsnNode field
+                    && field.desc.equals(capture.registryDescriptor()));
         if (!spawn(publication) || !data.repository.isSubtype(publication.owner, LEVEL)
                 || publicationOrdinal(data.body.method(), publication) != capture.publicationOrdinal()) return false;
         if (capture.mode() == CaptureMode.EFFECT_EVENT)

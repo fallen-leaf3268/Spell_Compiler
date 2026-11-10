@@ -32,7 +32,7 @@ final class FormulaBindingIdentities {
 
     String alias(FormulaAutomaticSites.Site site) {
         String identity = identity(site);
-        var baseline = identities == null ? null : identities.getAsJsonObject(identity);
+        var baseline = baseline(site);
         String alias = baseline == null ? site.definition().alias() : baseline.get("alias").getAsString();
         if (baseline == null && identities != null) alias = alias.replaceFirst("_[0-9]+$", "") + "_p" + digest(identity);
         if (!assigned.add(alias) || baseline == null && identities != null && reserved.contains(alias))
@@ -41,7 +41,7 @@ final class FormulaBindingIdentities {
     }
 
     FormulaBackwardSlice.Result inputs(FormulaAutomaticSites.Site site, FormulaBackwardSlice.Result result) {
-        var baseline = identities == null ? null : identities.getAsJsonObject(identity(site));
+        var baseline = baseline(site);
         if (baseline == null || !result.supported()) return result;
         Map<String, JsonObject> previous = new LinkedHashMap<>();
         Set<String> used = new HashSet<>();
@@ -76,6 +76,18 @@ final class FormulaBindingIdentities {
         String expression = INPUT.matcher(result.expression()).replaceAll(match -> renamed.getOrDefault(match.group(), match.group()));
         inputs.sort(Comparator.comparingInt(input -> Integer.parseInt(input.name().substring(6))));
         return new FormulaBackwardSlice.Result(expression, inputs, result.completeness(), result.diagnostics(), result.nativePower());
+    }
+
+    private JsonObject baseline(FormulaAutomaticSites.Site site) {
+        if (identities == null) return null;
+        String key = identity(site);
+        var selected = identities.getAsJsonObject(key);
+        if (selected != null) return selected;
+        if ((site.kind() == FormulaAutomaticSites.Kind.EVENT_DAMAGE || site.kind() == FormulaAutomaticSites.Kind.EVENT_HEALING)
+                && site.contextMode() == FormulaAutomaticSites.ContextMode.ENTITY && site.contextSlot() >= 0
+                && site.casterSlot() == -1 && site.levelSlot() == -1 && site.spellSlot() == -1)
+            return identities.getAsJsonObject(key.substring(0, key.lastIndexOf(":ENTITY:")) + ":DIRECT:-1");
+        return null;
     }
 
     static String identity(FormulaAutomaticSites.Site site) {

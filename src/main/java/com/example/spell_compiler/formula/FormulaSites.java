@@ -43,20 +43,20 @@ public final class FormulaSites {
     private static final String ON_CAST = "(Lnet/minecraft/world/level/Level;ILnet/minecraft/world/entity/LivingEntity;Lio/redspace/ironsspellbooks/api/spells/CastSource;Lio/redspace/ironsspellbooks/api/magic/MagicData;)V";
     private static final String UNIQUE_INFO = "(ILnet/minecraft/world/entity/LivingEntity;)Ljava/util/List;";
     private static final String EFFECT_TICK = "(Lnet/minecraft/world/entity/LivingEntity;I)Z";
-    private static final Definition HEALING = definition("holy.HealingCircleSpell", "healing_interval_ticks", "healingInterval", "()I", 1, Integer.MAX_VALUE);
-    private static final Definition SUMMON = definition("ice.SummonPolarBearSpell", "summon_duration_ticks", "summonDuration", "(Ljava/lang/Object;)I", 0, Integer.MAX_VALUE);
-    private static final Definition FIRE = definition("fire.FireboltSpell", "fire_duration_ticks", "fireTicks", "()I", 0, Integer.MAX_VALUE);
+    private static final Definition HEALING = definition("holy.HealingCircleSpell", "healing_interval_ticks", "healingInterval", "(I)I", 1, Integer.MAX_VALUE);
+    private static final Definition SUMMON = definition("ice.SummonPolarBearSpell", "summon_duration_ticks", "summonDuration", "(Ljava/lang/Object;I)I", 0, Integer.MAX_VALUE);
+    private static final Definition FIRE = definition("fire.FireboltSpell", "fire_duration_ticks", "fireTicks", "(I)I", 0, Integer.MAX_VALUE);
     private static final Definition STORM = definition("lightning.ThunderstormSpell", "effect_damage", "thunderstormDamage",
             "(IFDFLjava/lang/Object;Ljava/lang/Object;)F", 0, Float.MAX_VALUE);
-    private static final Definition INTERVAL = definition("lightning.ThunderstormSpell", "strike_interval_ticks", "strikeInterval", "()I", 1, Integer.MAX_VALUE);
-    private static final Definition HORIZONTAL = definition("lightning.ThunderstormSpell", "horizontal_range", "horizontalRange", "()I", 0, 46340);
-    private static final Definition VERTICAL = definition("lightning.ThunderstormSpell", "vertical_range", "verticalRange", "()D", 0, Double.MAX_VALUE);
-    private static final Definition BONUS = definition("blood.SacrificeSpell", "summon_health_bonus", "sacrificeHealthBonus", "(F)F", 0, Float.MAX_VALUE);
+    private static final Definition INTERVAL = definition("lightning.ThunderstormSpell", "strike_interval_ticks", "strikeInterval", "(I)I", 1, Integer.MAX_VALUE);
+    private static final Definition HORIZONTAL = definition("lightning.ThunderstormSpell", "horizontal_range", "horizontalRange", "(I)I", 0, 46340);
+    private static final Definition VERTICAL = definition("lightning.ThunderstormSpell", "vertical_range", "verticalRange", "(I)D", 0, Double.MAX_VALUE);
+    private static final Definition BONUS = definition("blood.SacrificeSpell", "summon_health_bonus", "sacrificeHealthBonus", "(FI)F", 0, Float.MAX_VALUE);
     private static final List<Definition> DEFINITIONS = List.of(HEALING, SUMMON, FIRE, STORM, INTERVAL, HORIZONTAL, VERTICAL, BONUS);
     private static final List<Rule> RULES = List.of(
             rule(HEALING, "onCast", ON_CAST, Kind.CREATED_AOE, null, 1, 3),
             rule(SUMMON, "onCast", ON_CAST, Kind.SUMMON_DURATION, 12000, 1, 3),
-            rule(FIRE, "getDamageSource", "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/entity/Entity;)Lio/redspace/ironsspellbooks/damage/SpellDamageSource;", Kind.INT, 60, 1, 2),
+            rule(FIRE, "getDamageSource", "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/entity/Entity;)Lio/redspace/ironsspellbooks/damage/SpellDamageSource;", Kind.INT, 60, 1, 1),
             new Rule(EFFECT, Set.of("getDamageFromAmplifier"), "(ILnet/minecraft/world/entity/LivingEntity;)F", Kind.STORM_DAMAGE, STORM, null, 1, 1),
             new Rule(EFFECT, Set.of("shouldApplyEffectTickThisTick"), "(II)Z", Kind.INT, INTERVAL, 40, 1, -1),
             new Rule(EFFECT, Set.of("applyEffectTick", "m_6742_"), EFFECT_TICK, Kind.INT_AS_DOUBLE, HORIZONTAL, 20d, 2, 1),
@@ -98,8 +98,24 @@ public final class FormulaSites {
         return DEFINITIONS.stream().filter(value -> value.dispatchKey().equals(dispatchKey)).findFirst().orElse(null);
     }
 
+    public static Set<String> requiredRuleOwners(String dispatchKey) {
+        return RULES.stream().filter(rule -> rule.definition().dispatchKey().equals(dispatchKey)).map(Rule::owner)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
     public static Number validateValue(String helperKey, Number value) {
-        var definition = DEFINITIONS.stream().filter(entry -> entry.key().equals(helperKey)).findFirst()
+        String selected = switch (helperKey) {
+            case "healingInterval()I" -> "healingInterval(I)I";
+            case "fireTicks()I" -> "fireTicks(I)I";
+            case "strikeInterval()I" -> "strikeInterval(I)I";
+            case "horizontalRange()I" -> "horizontalRange(I)I";
+            case "verticalRange()D" -> "verticalRange(I)D";
+            case "hasteRadius()F" -> "hasteRadius(I)F";
+            case "summonDuration(Ljava/lang/Object;)I" -> "summonDuration(Ljava/lang/Object;I)I";
+            case "sacrificeHealthBonus(F)F" -> "sacrificeHealthBonus(FI)F";
+            default -> helperKey;
+        };
+        var definition = DEFINITIONS.stream().filter(entry -> entry.key().equals(selected)).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("Unknown numeric site: " + helperKey));
         double numeric = value.doubleValue();
         if (!Double.isFinite(numeric) || numeric < definition.minimum() || numeric > definition.maximum())
@@ -211,8 +227,9 @@ public final class FormulaSites {
             code.add(new InsnNode(Opcodes.DUP));
             code.add(new LdcInsnNode(key));
             actor(code, rule.actorSlot());
+            level(code, method);
             code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS, "initializeHealingInterval",
-                    "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)V", false));
+                    "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;I)V", false));
             method.instructions.insert(point, code);
         } else if (rule.kind() == Kind.STORM_DAMAGE) {
             code.add(new LdcInsnNode(key));
@@ -231,12 +248,14 @@ public final class FormulaSites {
             code.add(new LdcInsnNode(key));
             actor(code, rule.actorSlot());
             code.add(new VarInsnNode(Opcodes.FLOAD, healthSlot));
+            level(code, method);
             code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS, "overrideFloat",
-                    "(FLjava/lang/String;Ljava/lang/Object;F)F", false));
+                    "(FLjava/lang/String;Ljava/lang/Object;FI)F", false));
             method.instructions.insert(point, code);
         } else {
             code.add(new LdcInsnNode(key));
             actor(code, rule.actorSlot());
+            level(code, method);
             String name = switch (rule.kind()) {
                 case INT -> "overrideInt";
                 case FLOAT -> "overrideFloat";
@@ -249,10 +268,17 @@ public final class FormulaSites {
             String type = rule.kind() == Kind.FLOAT ? "F"
                     : rule.kind() == Kind.DOUBLE || rule.kind() == Kind.INT_AS_DOUBLE ? "D" : "I";
             code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS, name,
-                    '(' + type + "Ljava/lang/String;Ljava/lang/Object;)" + type, false));
+                    '(' + type + "Ljava/lang/String;Ljava/lang/Object;I)" + type, false));
             method.instructions.insert(point, code);
         }
-        method.maxStack += 5;
+        method.maxStack += 6;
+    }
+
+    private static void level(InsnList code, MethodNode method) {
+        if (method.desc.startsWith("(Lnet/minecraft/world/level/Level;ILnet/minecraft/world/entity/LivingEntity;"))
+            code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        else if (method.desc.equals(UNIQUE_INFO)) code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        else code.add(new InsnNode(Opcodes.ICONST_M1));
     }
 
     private static void actor(InsnList code, int slot) {

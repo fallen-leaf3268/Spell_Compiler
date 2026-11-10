@@ -52,17 +52,27 @@ public final class FormulaAttributeRuntime {
         if (values.isEmpty()) return Map.of();
         if (values.size() > 32) throw new IllegalArgumentException("Too many attribute values");
         Map<String, FormulaAttributes.Value> valid = new LinkedHashMap<>();
-        for (var binding : index().effects().getOrDefault(effect, List.of())) {
-            var component = binding.component();
-            var value = values.get(component.key());
-            if (value == null || !effect.equals(component.effectId())) continue;
-            if (!component.sourceAttribute().equals(value.sourceAttribute()) || !component.modifierId().equals(value.sourceModifierId())
-                    || !binding.modifierId().equals(value.modifierId()) || value.operation() == null || !Double.isFinite(value.amount())
-                    || !BuiltInRegistries.ATTRIBUTE.containsKey(ResourceLocation.parse(value.targetAttribute())))
-                throw new IllegalArgumentException("Invalid attribute snapshot: " + component.key());
-            valid.put(component.key(), value);
+        var candidates = index().effects().getOrDefault(effect, List.of());
+        for (var entry : values.entrySet()) {
+            var value = entry.getValue();
+            boolean known = false;
+            boolean accepted = false;
+            for (var binding : candidates) {
+                var component = binding.component();
+                if (!component.key().equals(entry.getKey()) || !effect.equals(component.effectId())) continue;
+                known = true;
+                if (value != null && component.sourceAttribute().equals(value.sourceAttribute())
+                        && component.modifierId().equals(value.sourceModifierId()) && binding.modifierId().equals(value.modifierId())
+                        && value.operation() != null && Double.isFinite(value.amount())
+                        && BuiltInRegistries.ATTRIBUTE.containsKey(ResourceLocation.parse(value.targetAttribute()))) {
+                    accepted = true;
+                    break;
+                }
+            }
+            if (!accepted) throw new IllegalArgumentException(known
+                    ? "Invalid attribute snapshot: " + entry.getKey() : "Unknown attribute snapshot component");
+            valid.put(entry.getKey(), value);
         }
-        if (valid.size() != values.size()) throw new IllegalArgumentException("Unknown attribute snapshot component");
         return Map.copyOf(valid);
     }
 

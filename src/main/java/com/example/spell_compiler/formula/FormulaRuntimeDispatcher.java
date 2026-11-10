@@ -21,6 +21,9 @@ public final class FormulaRuntimeDispatcher {
     private static final Logger LOGGER = LogManager.getLogger(FormulaRuntimeDispatcher.class);
     private static volatile Map<String, Invoker> server = Map.of();
     private static volatile Map<String, Invoker> client = Map.of();
+    private record OwnerIndex(Map<String, Invoker> source, Map<String, java.util.List<Invoker>> owners) {}
+    private static volatile OwnerIndex serverOwners = new OwnerIndex(server, Map.of());
+    private static volatile OwnerIndex clientOwners = new OwnerIndex(client, Map.of());
     private static volatile BiConsumer<String, Invoker> serverFailure = (key, invoker) -> {};
 
     private FormulaRuntimeDispatcher() {}
@@ -68,6 +71,27 @@ public final class FormulaRuntimeDispatcher {
     public static void clearClient() { client = Map.of(); }
 
     public static boolean hasOverride(String key, Object actor) { return resolve(key, actor) != null; }
+
+    public static boolean hasActiveOwner(String owner, Object actor) {
+        if (FormulaNativeValues.isEvaluatingOriginal()) return false;
+        boolean clientSide = actor instanceof Entity entity ? entity.level().isClientSide : EffectiveSide.get().isClient();
+        Map<String, Invoker> selected = clientSide ? client : server;
+        OwnerIndex index = clientSide ? clientOwners : serverOwners;
+        if (index.source() != selected) {
+            Map<String, java.util.List<Invoker>> owners = new LinkedHashMap<>();
+            selected.forEach((key, invoker) -> {
+                int separator = key.indexOf('#');
+                if (separator > 0) owners.computeIfAbsent(key.substring(0, separator), ignored -> new java.util.ArrayList<>()).add(invoker);
+            });
+            owners.replaceAll((key, values) -> java.util.List.copyOf(values));
+            index = new OwnerIndex(selected, Map.copyOf(owners));
+            if (clientSide) clientOwners = index;
+            else serverOwners = index;
+        }
+        for (Invoker invoker : index.owners().getOrDefault(owner.replace('/', '.'), java.util.List.of()))
+            if (!(invoker instanceof GuardedInvoker guarded) || !guarded.disabled.get()) return true;
+        return false;
+    }
 
     public static boolean isActive(String key, Object actor) {
         return resolveActive(key, actor) != null;
@@ -132,6 +156,8 @@ public final class FormulaRuntimeDispatcher {
                 if (!Double.isFinite(value.doubleValue()))
                     throw new ArithmeticException("法术公式返回了非有限数值：" + value);
                 return value;
+            } catch (FormulaContextUnavailableException unavailable) {
+                return null;
             } catch (RuntimeException | LinkageError failure) {
                 if (serverSide && disabled.compareAndSet(false, true)) {
                     LOGGER.error("[SpellFormula] {} 执行失败，本次加载期间回退到原生公式", key, failure);

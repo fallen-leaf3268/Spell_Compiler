@@ -128,6 +128,7 @@ public final class FormulaExecutionGraph {
     private record Application(MethodId method, FieldId field) {}
     private record ExecutionMethod(MethodId method, String receiver) {}
     private record CallTarget(MethodId method, String receiver, boolean complete, List<MethodId> candidates, String reason) {}
+    private record EffectFootprint(Set<FieldId> fields, boolean unbounded, List<String> diagnostics) {}
 
     private FormulaExecutionGraph() {}
 
@@ -148,6 +149,7 @@ public final class FormulaExecutionGraph {
         private final Map<MethodId, Data> bodies = new HashMap<>();
         private final Map<MethodId, String> broken = new HashMap<>();
         private final Map<FieldId, Registration> registrations = new LinkedHashMap<>();
+        private final Map<FieldId, String> registeredSpellReceivers = new HashMap<>();
         private final Map<FieldId, FieldId> aliases = new HashMap<>();
         private final Map<FieldId, Set<MethodId>> events = new LinkedHashMap<>();
         private final Map<FieldId, Set<MethodId>> unregisteredEvents = new LinkedHashMap<>();
@@ -167,6 +169,9 @@ public final class FormulaExecutionGraph {
         private final Map<MethodId, List<MethodId>> sourceOverrides = new HashMap<>();
         private final Map<MethodId, Boolean> applicationPotential = new HashMap<>();
         private final Set<String> ownershipDiagnostics = new LinkedHashSet<>();
+        private final FormulaEffectOwnership effectOwnership = new FormulaEffectOwnership();
+        private final Map<MethodId, EffectFootprint> effectFootprints = new HashMap<>();
+        private final Map<MethodId, Set<MethodId>> functionalImplementations = new HashMap<>();
 
         private Index(FormulaClassRepository repository) {
             this.repository = Objects.requireNonNull(repository);
@@ -179,6 +184,7 @@ public final class FormulaExecutionGraph {
                     if ((method.access & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT)) == 0)
                         sourceMethods.computeIfAbsent(method.name + method.desc, ignored -> new ArrayList<>()).add(id(source.name, method));
             spellCallbacks = spellCallbackContracts();
+            indexFunctionalImplementations();
             indexRegistrations();
             indexEvents();
             for (String name : sortedSourceNames) {
@@ -195,6 +201,18 @@ public final class FormulaExecutionGraph {
         public synchronized Analysis analyze(String spellClass) {
             String name = Objects.requireNonNull(spellClass).replace('.', '/');
             return analyses.computeIfAbsent(name, this::build);
+        }
+
+        public synchronized List<FormulaEffectOwnership.Uncertainty> ownershipUncertainties() {
+            return effectOwnership.uncertainties();
+        }
+
+        public synchronized String registeredSpellReceiver(String owner, String name, String descriptor) {
+            var field = new FieldId(owner.replace('.', '/'), name, descriptor);
+            var declaration = repository.resolveField(field.owner(), field.name(), field.descriptor());
+            if (declaration == null || (declaration.field().access & (Opcodes.ACC_STATIC | Opcodes.ACC_FINAL))
+                    != (Opcodes.ACC_STATIC | Opcodes.ACC_FINAL)) return null;
+            return registeredSpellReceivers.get(canonical(field));
         }
 
         public synchronized SynchronousMethods synchronousHelpers(String spellClass) {
@@ -494,9 +512,8 @@ public final class FormulaExecutionGraph {
             Set<MethodId> roots = spellRoots(spell, EXECUTION_ROOTS);
             roots.addAll(spellRoots(spell, DESCRIPTION_ROOTS));
             graph.walk(roots);
-            ownershipDiagnostics.stream().limit(3).forEach(graph.diagnostics::add);
-            if (ownershipDiagnostics.size() > 3)
-                graph.diagnostics.add("效果施加归属索引共有 " + ownershipDiagnostics.size() + " 项不完整来源，仅列出前 3 项");
+            effectOwnership.uncertainties().stream().filter(value -> value.spellClass().equals(spell)).limit(3)
+                    .map(FormulaEffectOwnership.Uncertainty::diagnostic).forEach(graph.diagnostics::add);
             List<EffectLink> links = new ArrayList<>();
             Map<FieldId, Set<MethodId>> grouped = new LinkedHashMap<>();
             for (Application value : applications.getOrDefault(spell, List.of()))
@@ -530,8 +547,11 @@ public final class FormulaExecutionGraph {
                 if (ownership.size() > 1)
                     graph.diagnostics.add("效果被多支法术施加，消费归属存在歧义：" + field.key() + " "
                             + ownership.stream().sorted().toList());
+                var decision = effectOwnership.decision(effectKey(field));
+                for (var uncertainty : decision.uncertainties())
+                    graph.diagnostics.add("效果施加归属尚未完整：" + field.key() + " <- " + uncertainty.diagnostic());
                 links.add(new EffectLink(field.owner(), field.name(), registration == null ? "" : registration.effectClass(),
-                        entry.getValue(), handlers, related, ownership, ownershipDiagnostics.isEmpty()));
+                        entry.getValue(), handlers, related, ownership, decision.complete()));
             }
             links.sort(Comparator.comparing(EffectLink::registryOwner).thenComparing(EffectLink::registryField));
             return graph.result(spell, links);
@@ -600,6 +620,7 @@ public final class FormulaExecutionGraph {
         }
 
         private void indexRegistrations() {
+            Map<FieldId, Integer> writes = new HashMap<>();
             for (String name : sortedSourceNames) {
                 ClassNode source = repository.classNode(name);
                 for (MethodNode method : source.methods) {
@@ -609,10 +630,17 @@ public final class FormulaExecutionGraph {
                     for (AbstractInsnNode instruction : method.instructions) {
                         if (!(instruction instanceof FieldInsnNode write) || write.getOpcode() != Opcodes.PUTSTATIC) continue;
                         FieldId destination = field(write);
+                        writes.merge(destination, 1, Integer::sum);
                         AbstractInsnNode origin = data.origin(data.top(write));
                         if (origin instanceof FieldInsnNode read && read.getOpcode() == Opcodes.GETSTATIC) {
                             aliases.put(destination, field(read));
                             continue;
+                        }
+                        if (origin instanceof MethodInsnNode call && registeredInstanceCall(call)) {
+                            AbstractInsnNode instance = data.origin(data.argument(call, 0));
+                            if (instance instanceof TypeInsnNode allocation && allocation.getOpcode() == Opcodes.NEW
+                                    && repository.isSubtype(allocation.desc, SPELL) && data.constructor(allocation) != null)
+                                registeredSpellReceivers.put(destination, allocation.desc);
                         }
                         if (!(origin instanceof MethodInsnNode call) || !call.name.equals("register")
                                 || !repository.isSubtype(call.owner, REGISTER)) continue;
@@ -633,20 +661,64 @@ public final class FormulaExecutionGraph {
                                 }
                             }
                         }
-                        if (selected != null) registrations.put(destination, selected);
+                        if (selected != null) {
+                            if (repository.isSubtype(selected.effectClass(), SPELL)) registeredSpellReceivers.put(destination, selected.effectClass());
+                            else registrations.put(destination, selected);
+                        }
                     }
                 }
             }
+            writes.forEach((field, count) -> { if (count > 1) registeredSpellReceivers.remove(field); });
             for (FieldId alias : aliases.keySet()) {
                 FieldId canonical = canonical(alias);
                 Registration registration = registrations.get(canonical);
                 if (registration != null) registrations.put(alias, registration);
+                String spell = registeredSpellReceivers.get(canonical);
+                if (spell != null && writes.getOrDefault(alias, 0) <= 1) registeredSpellReceivers.put(alias, spell);
             }
+        }
+
+        private boolean registeredInstanceCall(MethodInsnNode call) {
+            if (call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !List.of(Type.getArgumentTypes(call.desc)).equals(List.of(Type.getObjectType(SPELL)))) return false;
+            var resolved = repository.resolveMethod(call.owner, call.name, call.desc);
+            if (resolved == null || !sourceNames.contains(resolved.owner().name)) return false;
+            List<AbstractInsnNode> code = new ArrayList<>();
+            for (AbstractInsnNode instruction : resolved.method().instructions) if (instruction.getOpcode() >= 0) code.add(instruction);
+            if (code.size() != 7 || !(code.get(0) instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.GETSTATIC
+                    || Type.getType(field.desc).getSort() != Type.OBJECT
+                    || !repository.isSubtype(Type.getType(field.desc).getInternalName(), REGISTER)
+                    || !(code.get(1) instanceof VarInsnNode first) || first.getOpcode() != Opcodes.ALOAD || first.var != 0
+                    || !(code.get(2) instanceof MethodInsnNode name) || name.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !name.owner.equals(SPELL) || !name.name.equals("getSpellName") || !name.desc.equals("()Ljava/lang/String;")
+                    || !(code.get(3) instanceof VarInsnNode capture) || capture.getOpcode() != Opcodes.ALOAD || capture.var != 0
+                    || !(code.get(4) instanceof InvokeDynamicInsnNode supplier)
+                    || !supplier.desc.equals("(L" + SPELL + ";)Ljava/util/function/Supplier;")
+                    || !supplier.bsm.getOwner().equals("java/lang/invoke/LambdaMetafactory") || supplier.bsmArgs.length < 2
+                    || !(supplier.bsmArgs[1] instanceof Handle implementation) || implementation.getTag() != Opcodes.H_INVOKESTATIC
+                    || !implementation.getDesc().equals("(L" + SPELL + ";)L" + SPELL + ';')
+                    || !(code.get(5) instanceof MethodInsnNode register) || register.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !repository.isSubtype(register.owner, REGISTER) || !register.name.equals("register")
+                    || !List.of(Type.getArgumentTypes(register.desc)).equals(List.of(Type.getType(String.class), Type.getType(java.util.function.Supplier.class)))
+                    || !compatibleRegisterReturn(register.desc, call.desc) || code.get(6).getOpcode() != Opcodes.ARETURN)
+                return false;
+            var target = repository.resolveMethod(implementation.getOwner(), implementation.getName(), implementation.getDesc());
+            if (target == null) return false;
+            List<AbstractInsnNode> identity = new ArrayList<>();
+            for (AbstractInsnNode instruction : target.method().instructions) if (instruction.getOpcode() >= 0) identity.add(instruction);
+            return identity.size() == 2 && identity.get(0) instanceof VarInsnNode input && input.getOpcode() == Opcodes.ALOAD
+                    && input.var == 0 && identity.get(1).getOpcode() == Opcodes.ARETURN;
+        }
+
+        private boolean compatibleRegisterReturn(String actualMethod, String expectedMethod) {
+            Type actual = Type.getReturnType(actualMethod), expected = Type.getReturnType(expectedMethod);
+            return actual.equals(expected) || actual.getSort() == Type.OBJECT && expected.getSort() == Type.OBJECT
+                    && repository.isSubtype(actual.getInternalName(), expected.getInternalName());
         }
 
         private Registration factory(Handle handle) {
             if (handle.getTag() == Opcodes.H_NEWINVOKESPECIAL && handle.getName().equals("<init>")
-                    && repository.isSubtype(handle.getOwner(), EFFECT)) {
+                    && (repository.isSubtype(handle.getOwner(), EFFECT) || repository.isSubtype(handle.getOwner(), SPELL))) {
                 var constructor = new MethodId(handle.getOwner(), handle.getName(), handle.getDesc());
                 return new Registration(handle.getOwner(), constructor, constructor);
             }
@@ -659,8 +731,16 @@ public final class FormulaExecutionGraph {
             for (AbstractInsnNode instruction : resolved.method().instructions) {
                 if (instruction.getOpcode() != Opcodes.ARETURN) continue;
                 AbstractInsnNode origin = data.origin(data.top(instruction));
+                List<MethodInsnNode> fluent = new ArrayList<>();
+                Set<AbstractInsnNode> visited = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+                while (origin instanceof MethodInsnNode call && visited.add(origin)
+                        && returnsReceiver(call, null, new HashSet<>(), 0)) {
+                    fluent.add(call);
+                    origin = data.origin(data.receiver(call));
+                }
                 if (!(origin instanceof TypeInsnNode allocation) || allocation.getOpcode() != Opcodes.NEW
-                        || !repository.isSubtype(allocation.desc, EFFECT)) return null;
+                        || (!repository.isSubtype(allocation.desc, EFFECT) && !repository.isSubtype(allocation.desc, SPELL))) return null;
+                if (fluent.stream().anyMatch(call -> !returnsReceiver(call, allocation.desc, new HashSet<>(), 0))) return null;
                 MethodId constructor = data.constructor(allocation);
                 if (constructor == null) return null;
                 var candidate = new Registration(allocation.desc, factory, constructor);
@@ -668,6 +748,29 @@ public final class FormulaExecutionGraph {
                 result = candidate;
             }
             return result;
+        }
+
+        private boolean returnsReceiver(MethodInsnNode call, String receiver, Set<String> visited, int depth) {
+            if (depth > 8 || call.getOpcode() == Opcodes.INVOKESTATIC || call.name.equals("<init>")) return false;
+            var resolved = receiver == null ? repository.resolveMethod(call.owner, call.name, call.desc)
+                    : repository.resolveInvocation(call.owner, call, receiver).target();
+            if (resolved == null || (resolved.method().access & (Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0
+                    || !visited.add(resolved.owner().name + '#' + resolved.method().name + resolved.method().desc)) return false;
+            var flow = FormulaDataFlow.analyze(repository, resolved.owner().name, resolved.method());
+            if (!flow.successful()) return false;
+            boolean returned = false;
+            for (var operation : flow.instructions()) {
+                if (operation.instruction().getOpcode() != Opcodes.ARETURN || !flow.reachable(operation.instruction())) continue;
+                if (operation.operands().size() != 1) return false;
+                returned = true;
+                var origin = flow.origin(operation.operands().get(0));
+                Set<FormulaDataFlow.Node> seen = new HashSet<>();
+                while (origin != null && seen.add(origin) && origin.instruction() instanceof MethodInsnNode forwarded
+                        && returnsReceiver(forwarded, receiver, new HashSet<>(visited), depth + 1))
+                    origin = flow.origin(flow.receiver(forwarded));
+                if (origin == null || origin.kind() != FormulaDataFlow.NodeKind.PARAMETER || origin.parameterSlot() != 0) return false;
+            }
+            return returned;
         }
 
         private void indexEvents() {
@@ -736,7 +839,7 @@ public final class FormulaExecutionGraph {
                 Data data = body(id);
                 if (data == null) {
                     if (applicationPotential.computeIfAbsent(id, this::mayApplyEffect))
-                        ownershipDiagnostics.add("效果施加归属索引不完整，法术方法无法分析：" + spell + " -> " + id.key());
+                        ownershipUncertainty(spell, id, List.of(id), "效果施加归属索引不完整，法术方法无法分析：" + spell + " -> " + id.key());
                     continue;
                 }
                     List<SynchronousCallback> callbacks = callbackBody(id);
@@ -761,10 +864,14 @@ public final class FormulaExecutionGraph {
                     }
                     CallTarget resolution = resolved(call, data, work.receiver());
                     MethodId target = resolution.method();
+                    MethodId symbolic = new MethodId(call.owner, call.name, call.desc);
                     if (!resolution.complete() && !accessor(call) && (resolution.candidates().isEmpty()
-                            || resolution.candidates().stream().filter(candidate -> sourceNames.contains(candidate.owner()))
+                            ? sourceOverrides.computeIfAbsent(symbolic, this::sourceOverrides).isEmpty()
+                            || applicationPotential.computeIfAbsent(symbolic, this::mayApplyEffect)
+                            : resolution.candidates().stream().filter(candidate -> sourceNames.contains(candidate.owner()))
                             .anyMatch(candidate -> applicationPotential.computeIfAbsent(candidate, this::mayApplyEffect))))
-                        ownershipDiagnostics.add("效果施加归属索引不完整，法术调用无法唯一解析：" + spell + " -> "
+                        ownershipUncertainty(spell, id, resolution.candidates().isEmpty() ? List.of(symbolic) : resolution.candidates(),
+                                "效果施加归属索引不完整，法术调用无法唯一解析：" + spell + " -> "
                                 + id.key() + " -> " + call.owner + '#' + call.name + call.desc);
                     if (target != null && expandable(target)) pending.add(new ExecutionMethod(target, resolution.receiver()));
                 }
@@ -773,9 +880,119 @@ public final class FormulaExecutionGraph {
                     if (field != null) result.add(new Application(id, field));
                 }
             }
-            pending.stream().filter(value -> !visited.contains(value)).findFirst().ifPresent(value ->
-                    ownershipDiagnostics.add("效果施加归属索引达到静态分析边界：" + spell + " -> " + value.method().key()));
+            List<MethodId> remaining = pending.stream().filter(value -> !visited.contains(value)).map(ExecutionMethod::method).toList();
+            if (!remaining.isEmpty()) ownershipUncertainty(spell, remaining.get(0), remaining,
+                    "效果施加归属索引达到静态分析边界：" + spell + " -> " + remaining.get(0).key());
             return List.copyOf(result);
+        }
+
+        private FormulaEffectOwnership.Effect effectKey(FieldId field) {
+            FieldId value = canonical(field);
+            return new FormulaEffectOwnership.Effect(value.owner(), value.name());
+        }
+
+        private void indexFunctionalImplementations() {
+            for (ClassNode source : sources) for (MethodNode method : source.methods)
+                for (AbstractInsnNode instruction : method.instructions)
+                    if (instruction instanceof InvokeDynamicInsnNode dynamic
+                            && dynamic.bsm.getOwner().equals("java/lang/invoke/LambdaMetafactory")
+                            && dynamic.bsmArgs.length >= 2 && dynamic.bsmArgs[0] instanceof Type contract
+                            && dynamic.bsmArgs[1] instanceof Handle implementation
+                            && Type.getReturnType(dynamic.desc).getSort() == Type.OBJECT
+                            && sourceNames.contains(implementation.getOwner())) {
+                        MethodId key = new MethodId(Type.getReturnType(dynamic.desc).getInternalName(), dynamic.name, contract.getDescriptor());
+                        functionalImplementations.computeIfAbsent(key, ignored -> new LinkedHashSet<>())
+                                .add(new MethodId(implementation.getOwner(), implementation.getName(), implementation.getDesc()));
+                    }
+        }
+
+        private void ownershipUncertainty(String spell, MethodId caller, List<MethodId> candidates, String diagnostic) {
+            ownershipDiagnostics.add(diagnostic);
+            Set<FormulaEffectOwnership.Effect> possible = new LinkedHashSet<>();
+            Set<String> boundaries = new LinkedHashSet<>();
+            boolean unbounded = false;
+            Set<MethodId> domains = new LinkedHashSet<>();
+            for (MethodId candidate : candidates) {
+                var declaration = repository.resolveMethod(candidate.owner(), candidate.name(), candidate.descriptor());
+                Set<MethodId> implementations = functionalImplementations.getOrDefault(candidate, Set.of());
+                if (declaration != null && (declaration.method().access & Opcodes.ACC_ABSTRACT) != 0 && !implementations.isEmpty()) {
+                    domains.addAll(implementations);
+                    domains.addAll(sourceOverrides.computeIfAbsent(candidate, this::sourceOverrides));
+                } else domains.add(candidate);
+            }
+            for (MethodId candidate : domains) {
+                EffectFootprint footprint = effectFootprints.computeIfAbsent(candidate, this::effectFootprint);
+                footprint.fields().stream().map(this::effectKey).forEach(possible::add);
+                unbounded |= footprint.unbounded();
+                boundaries.addAll(footprint.diagnostics());
+            }
+            effectOwnership.add(new FormulaEffectOwnership.Uncertainty(spell, caller, possible, unbounded,
+                    boundaries.isEmpty() ? diagnostic : diagnostic + "，无法缩窄的效果来源：" + boundaries.stream().limit(3).toList()));
+        }
+
+        private EffectFootprint effectFootprint(MethodId root) {
+            Set<FieldId> fields = new LinkedHashSet<>();
+            Set<MethodId> visited = new HashSet<>();
+            ArrayDeque<MethodId> pending = new ArrayDeque<>();
+            pending.add(root);
+            boolean unbounded = false;
+            Set<String> diagnostics = new LinkedHashSet<>();
+            while (!pending.isEmpty() && visited.size() < MAX_METHODS) {
+                MethodId current = pending.removeFirst();
+                if (!visited.add(current)) continue;
+                var resolved = repository.resolveMethod(current.owner(), current.name(), current.descriptor());
+                if (resolved == null) { unbounded = true; diagnostics.add("MISSING_METHOD " + current.key()); continue; }
+                MethodNode method = resolved.method();
+                if ((method.access & Opcodes.ACC_ABSTRACT) != 0) {
+                    List<MethodId> overrides = sourceOverrides.computeIfAbsent(current, this::sourceOverrides);
+                    Set<MethodId> functions = functionalImplementations.getOrDefault(current, Set.of());
+                    pending.addAll(overrides);
+                    pending.addAll(functions);
+                    if (overrides.isEmpty() && functions.isEmpty() && Type.getReturnType(current.descriptor()).equals(Type.VOID_TYPE)) {
+                        unbounded = true;
+                        diagnostics.add("UNKNOWN_IMPLEMENTATION " + current.key());
+                    }
+                    continue;
+                }
+                if ((method.access & Opcodes.ACC_NATIVE) != 0) { unbounded = true; diagnostics.add("NATIVE_METHOD " + current.key()); continue; }
+                Data data = body(current);
+                Map<AbstractInsnNode, FieldId> constructed = new IdentityHashMap<>();
+                if (data != null) for (AbstractInsnNode instruction : method.instructions) {
+                    if (!data.flow.reachable(instruction) || !(instruction instanceof MethodInsnNode call)
+                            || !call.owner.equals(INSTANCE) || !call.name.equals("<init>")) continue;
+                    FieldId field = data.holder(data.argument(call, 0));
+                    AbstractInsnNode allocation = data.origin(data.receiver(call));
+                    if (field != null && allocation != null) constructed.put(allocation, canonical(field));
+                }
+                for (AbstractInsnNode instruction : method.instructions) {
+                    if (data != null && !data.flow.reachable(instruction)) continue;
+                    if (instruction instanceof InvokeDynamicInsnNode dynamic)
+                        for (Object argument : dynamic.bsmArgs)
+                            if (argument instanceof Handle handle && sourceNames.contains(handle.getOwner()))
+                                pending.add(new MethodId(handle.getOwner(), handle.getName(), handle.getDesc()));
+                    if (!(instruction instanceof MethodInsnNode call)) continue;
+                    Type[] arguments = Type.getArgumentTypes(call.desc);
+                    if (Set.of("addEffect", "forceAddEffect").contains(call.name)
+                            && arguments.length > 0 && arguments[0].equals(Type.getObjectType(INSTANCE))
+                            && repository.isSubtype(call.owner, LIVING)) {
+                        FieldId field = data == null ? null : constructed.get(data.origin(data.argument(call, 0)));
+                        if (field == null) { unbounded = true; diagnostics.add("DYNAMIC_EFFECT " + current.key()); }
+                        else fields.add(field);
+                    }
+                    CallTarget resolution;
+                    if (data != null) resolution = resolved(call, data, null);
+                    else {
+                        var target = repository.resolveInvocation(current.owner(), call, null);
+                        resolution = new CallTarget(target.target() == null ? null : id(target.target().owner().name, target.target().method()),
+                                null, target.target() != null, target.candidates().stream().map(value -> id(value.owner().name, value.method())).toList(), target.reason());
+                    }
+                    if (resolution.method() != null && expandable(resolution.method())) pending.add(resolution.method());
+                    if (!resolution.complete()) for (MethodId candidate : resolution.candidates())
+                        if (expandable(candidate)) pending.add(candidate);
+                }
+            }
+            if (pending.stream().anyMatch(value -> !visited.contains(value))) { unbounded = true; diagnostics.add("METHOD_LIMIT " + root.key()); }
+            return new EffectFootprint(Set.copyOf(fields), unbounded, List.copyOf(diagnostics));
         }
 
         private boolean expandable(MethodId method) {
@@ -807,6 +1024,12 @@ public final class FormulaExecutionGraph {
                     && (data.method.access & Opcodes.ACC_STATIC) == 0 && data.parameter(data.receiver(call), 0)) receiver = context;
             else if (data.origin(data.receiver(call)) instanceof TypeInsnNode allocation && allocation.getOpcode() == Opcodes.NEW)
                 receiver = allocation.desc;
+            else {
+                FieldId field = data.holder(data.receiver(call));
+                var declaration = field == null ? null : repository.resolveField(field.owner(), field.name(), field.descriptor());
+                if (declaration != null && (declaration.field().access & (Opcodes.ACC_STATIC | Opcodes.ACC_FINAL))
+                        == (Opcodes.ACC_STATIC | Opcodes.ACC_FINAL)) receiver = registeredSpellReceivers.get(canonical(field));
+            }
             var resolution = repository.resolveInvocation(data.owner, call, receiver);
             List<MethodId> candidates = resolution.candidates().stream().map(value -> id(value.owner().name, value.method())).toList();
             var target = resolution.target();

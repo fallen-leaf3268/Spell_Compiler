@@ -31,7 +31,8 @@ final class FormulaAutomaticInjector {
     static Set<String> apply(String owner, ClassNode target, List<FormulaAutomaticSites.Site> sites) {
         String selectedOwner = owner.replace('/', '.');
         List<FormulaAutomaticSites.Site> selected = sites.stream().filter(site -> site.owner().equals(selectedOwner)).toList();
-        if (selected.isEmpty() && !FormulaEntityFlow.hasCaptures(selectedOwner) && !FormulaCastContext.hasRoots(selectedOwner)) return Set.of();
+        boolean explosionOwner = FormulaExplosionBindings.targetClasses().contains(selectedOwner);
+        if (selected.isEmpty() && !FormulaEntityFlow.hasCaptures(selectedOwner) && !FormulaCastContext.hasRoots(selectedOwner) && !explosionOwner) return Set.of();
         if (!selectedOwner.equals(target.name.replace('/', '.')))
             throw new IllegalArgumentException("自动消费入口与目标类不符：" + selectedOwner);
         List<MethodNode> copies = new ArrayList<>();
@@ -41,9 +42,11 @@ final class FormulaAutomaticInjector {
             method.accept(copy);
             copies.add(copy);
         }
+        FormulaClassRepository repository = FormulaClassRepository.of(target);
+        var movement = FormulaMovementPublication.prepare(repository, target.name, copies, selected);
+        Runnable explosions = FormulaExplosionBindings.prepare(selectedOwner, copies);
         Runnable captures = FormulaEntityFlow.prepareCaptures(selectedOwner, copies);
         Runnable scopes = FormulaCastContext.prepareRoots(selectedOwner, copies);
-        FormulaClassRepository repository = FormulaClassRepository.of(target);
         var inputCaptures = FormulaInputCapture.prepare(repository, target.name, copies, selected);
         Map<AbstractInsnNode, AbstractInsnNode> modifiedResults = new IdentityHashMap<>();
         Map<String, Point> points = new LinkedHashMap<>();
@@ -58,7 +61,7 @@ final class FormulaAutomaticInjector {
             MethodNode method = methods.get(0);
             if (!fingerprints.computeIfAbsent(method, FormulaAutomaticInjector::fingerprint).equals(site.methodFingerprint()))
                 throw mismatch(site, "原始方法结构已经变化");
-            validateContext(method, site);
+            validateContext(repository, target.name, method, site);
             List<AbstractInsnNode> instructions = executableInstructions.computeIfAbsent(method, FormulaAutomaticInjector::executable);
             if (site.producerIndex() < 0 || site.producerIndex() >= instructions.size())
                 throw mismatch(site, "数值生产点不存在");
@@ -97,6 +100,17 @@ final class FormulaAutomaticInjector {
         }
         for (Arguments selectedArguments : arguments.values()) {
             MethodNode method = selectedArguments.method();
+            if (selectedArguments.sites().size() == 1 && selectedArguments.sites().containsKey(0)) {
+                var site = selectedArguments.sites().get(0);
+                var store = FormulaHealingEventFlow.sharedStore(repository, target.name, method, selectedArguments.call(), site);
+                if (store != null) {
+                    InsnList shared = new InsnList();
+                    hook(shared, site, inputCaptures);
+                    method.instructions.insertBefore(store, shared);
+                    method.maxStack += 16;
+                    continue;
+                }
+            }
             Type[] types = Type.getArgumentTypes(selectedArguments.call().desc);
             int[] slots = new int[types.length];
             int next = method.maxLocals;
@@ -121,8 +135,10 @@ final class FormulaAutomaticInjector {
         }
         inputCaptures.apply(modifiedResults);
         captures.run();
+        explosions.run();
+        boolean synchronizedPublication = movement.apply();
         scopes.run();
-        if (!inputCaptures.empty()) {
+        if (!inputCaptures.empty() || synchronizedPublication || explosionOwner) {
             ClassNode framed = new ClassNode(Opcodes.ASM9);
             target.accept(framed);
             framed.methods = copies;
@@ -190,9 +206,7 @@ final class FormulaAutomaticInjector {
         if (unchanged != null) instructions.add(unchanged);
     }
 
-    private static void validateContext(MethodNode method, FormulaAutomaticSites.Site site) {
-        if (!contextIntact(method, site.casterSlot(), site.levelSlot(), site.spellSlot(), site.contextSlot()))
-            throw mismatch(site, "原参数槽被改写，无法保持施法上下文");
+    private static void validateContext(FormulaClassRepository repository, String owner, MethodNode method, FormulaAutomaticSites.Site site) {
         Map<Integer, Type> parameters = new LinkedHashMap<>();
         int slot = 0;
         if ((method.access & Opcodes.ACC_STATIC) == 0) parameters.put(slot++, Type.getType(Object.class));
@@ -200,6 +214,11 @@ final class FormulaAutomaticInjector {
             parameters.put(slot, type);
             slot += type.getSize();
         }
+        boolean localContext = site.contextMode() == FormulaAutomaticSites.ContextMode.ENTITY && !parameters.containsKey(site.contextSlot());
+        if (localContext && !FormulaUnifiedAnalysis.verifiedEventContext(repository, owner, method, site))
+            throw mismatch(site, "局部实体上下文未证明来自实际药效消费");
+        if (!contextIntact(method, site.casterSlot(), site.levelSlot(), site.spellSlot(), localContext ? -1 : site.contextSlot()))
+            throw mismatch(site, "原参数槽被改写，无法保持施法上下文");
         if (site.levelSlot() >= 0 && !Type.INT_TYPE.equals(parameters.get(site.levelSlot())))
             throw mismatch(site, "等级不是原方法的整数参数");
         for (int reference : new int[]{site.spellSlot(), site.casterSlot()}) {
@@ -208,7 +227,7 @@ final class FormulaAutomaticInjector {
             if (type == null || type.getSort() != Type.OBJECT && type.getSort() != Type.ARRAY)
                 throw mismatch(site, "法术或施法者不是原方法的对象参数");
         }
-        if (site.contextMode() == FormulaAutomaticSites.ContextMode.ENTITY) {
+        if (site.contextMode() == FormulaAutomaticSites.ContextMode.ENTITY && !localContext) {
             Type context = parameters.get(site.contextSlot());
             if (context == null || context.getSort() != Type.OBJECT && context.getSort() != Type.ARRAY)
                 throw mismatch(site, "实体上下文不是原方法的对象参数");

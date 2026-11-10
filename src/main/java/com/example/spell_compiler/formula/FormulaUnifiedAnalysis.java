@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.LinkedHashSet;
 
 public final class FormulaUnifiedAnalysis {
+    private static final Map<String, FormulaExecutionGraph.EffectLink> EVENT_SOURCES = new java.util.concurrent.ConcurrentHashMap<>();
     public record Restoration(String alias, String owner, String method, int instruction, int argument,
                               FormulaBackwardSlice.Completeness completeness, String expression,
                               List<FormulaCapturedInput> inputs, List<String> diagnostics) {
@@ -65,8 +66,9 @@ public final class FormulaUnifiedAnalysis {
                     if (!(instruction.instruction() instanceof MethodInsnNode call) || !flow.reachable(call)
                             || !flow.parameter(flow.receiver(call), 0)) continue;
                     for (var consumer : FormulaConsumptionModel.classify(repository, call)) {
-                        if (consumer.proof() != FormulaConsumptionModel.Proof.EFFECT_EVENT
-                                || !eventEffectInput(repository, flow, flow.arguments(call).get(consumer.argument()), call, effect, diagnostics)) continue;
+                        if (consumer.proof() != FormulaConsumptionModel.Proof.EFFECT_EVENT) continue;
+                        int sourceSlot = eventEffectInput(repository, flow, flow.arguments(call).get(consumer.argument()), call, effect, diagnostics);
+                        if (sourceSlot < 0) continue;
                         int position = executable.indexOf(call);
                         if (!visited.add(method.key() + ':' + position + ':' + consumer.argument())) continue;
                         String base = consumer.kind() == FormulaAutomaticSites.Kind.EVENT_DAMAGE ? "effect_damage" : "effect_healing";
@@ -74,9 +76,12 @@ public final class FormulaUnifiedAnalysis {
                         for (int suffix = 2; !aliases.add(alias); suffix++) alias = base + '_' + suffix;
                         var definition = new FormulaNumericSites.Definition(scan.spellClassName(), alias, 0f,
                                 FormulaNumericSites.ValueType.FLOAT, -Math.sqrt(Float.MAX_VALUE), Math.sqrt(Float.MAX_VALUE));
-                        sites.add(new FormulaAutomaticSites.Site(definition, owner, method.name(), method.descriptor(),
+                        var site = new FormulaAutomaticSites.Site(definition, owner, method.name(), method.descriptor(),
                                 position, FormulaAutomaticInjector.fingerprint(resolved.method()), -1, -1, -1,
-                                consumer.kind(), "native_value", consumer.argument()));
+                                consumer.kind(), "native_value", consumer.argument(),
+                                FormulaAutomaticSites.ContextMode.ENTITY, sourceSlot);
+                        EVENT_SOURCES.put(eventSourceKey(site), effect);
+                        sites.add(site);
                     }
                 }
             }
@@ -84,12 +89,13 @@ public final class FormulaUnifiedAnalysis {
         return new FormulaAutomaticSites.Scan(scan.spellClassName(), sites, diagnostics, scan.captures(), scan.scopes());
     }
 
-    private static boolean eventEffectInput(FormulaClassRepository repository, FormulaDataFlow.Analysis flow,
+    private static int eventEffectInput(FormulaClassRepository repository, FormulaDataFlow.Analysis flow,
                                            FormulaDataFlow.Value value, MethodInsnNode consumer,
                                            FormulaExecutionGraph.EffectLink effect, List<String> diagnostics) {
         var pending = new java.util.ArrayDeque<FormulaDataFlow.Node>(value.sources());
         var visited = new java.util.HashSet<FormulaDataFlow.Node>();
         boolean found = false;
+        FormulaDataFlow.Value receiver = null;
         while (!pending.isEmpty()) {
             var node = pending.removeFirst();
             if (!visited.add(node)) continue;
@@ -100,20 +106,65 @@ public final class FormulaUnifiedAnalysis {
                 if (instance == null || !(instance.instruction() instanceof MethodInsnNode get)
                         || !get.name.equals("getEffect")
                         || !get.desc.equals("(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/effect/MobEffectInstance;")
-                        || !repository.isSubtype(get.owner, "net/minecraft/world/entity/LivingEntity")) return false;
+                        || !repository.isSubtype(get.owner, "net/minecraft/world/entity/LivingEntity")) return -1;
                 var holder = flow.origin(flow.arguments(get).getFirst());
                 if (holder == null || !(holder.instruction() instanceof FieldInsnNode field)
                         || field.getOpcode() != Opcodes.GETSTATIC || !field.owner.equals(effect.registryOwner())
-                        || !field.name.equals(effect.registryField())) return false;
+                        || !field.name.equals(effect.registryField())) return -1;
                 if (!flow.resultDominates(amplifier, consumer)) {
                     diagnostics.add("EFFECT_EVENT_UNGUARDED_MERGE: " + flow.method().key() + ':' + flow.instruction(consumer).index());
-                    return false;
+                    return -1;
                 }
+                FormulaDataFlow.Value selected = flow.receiver(get);
+                if (flow.origin(selected) == null || receiver != null && !flow.origin(receiver).equals(flow.origin(selected))) return -1;
+                receiver = selected;
                 found = true;
             }
             for (var input : flow.dependencies(node)) pending.addAll(input.sources());
         }
-        return found;
+        if (!found || receiver == null) return -1;
+        var frame = flow.frameBefore(consumer);
+        if (frame == null) return -1;
+        var candidates = new ArrayList<Integer>();
+        for (int slot = 0; slot < frame.locals().size(); slot++) {
+            var local = frame.locals().get(slot);
+            if (local != null && local.type() != null && local.type().getSort() == Type.OBJECT
+                    && repository.isSubtype(local.type().getInternalName(), "net/minecraft/world/entity/LivingEntity")
+                    && flow.origin(receiver).equals(flow.origin(local))) candidates.add(slot);
+        }
+        if (candidates.size() == 1) return candidates.get(0);
+        if (!candidates.isEmpty()) return -1;
+        var origin = flow.origin(receiver);
+        if (origin.instruction() instanceof MethodInsnNode entity
+                && entity.name.equals("getEntity")
+                && entity.desc.equals("()Lnet/minecraft/world/entity/LivingEntity;")
+                && flow.parameter(flow.receiver(entity), 0)) return 0;
+        diagnostics.add("EFFECT_EVENT_SOURCE_UNAVAILABLE: " + flow.method().key());
+        return -1;
+    }
+
+    static boolean verifiedEventContext(FormulaClassRepository repository, String owner, org.objectweb.asm.tree.MethodNode method,
+                                        FormulaAutomaticSites.Site site) {
+        if (site.contextMode() != FormulaAutomaticSites.ContextMode.ENTITY
+                || site.kind() != FormulaAutomaticSites.Kind.EVENT_DAMAGE && site.kind() != FormulaAutomaticSites.Kind.EVENT_HEALING
+                || !owner.replace('/', '.').equals(site.owner()) || !method.name.equals(site.methodName())
+                || !method.desc.equals(site.methodDescriptor()) || !FormulaAutomaticInjector.fingerprint(method).equals(site.methodFingerprint())) return false;
+        var effect = EVENT_SOURCES.get(eventSourceKey(site));
+        if (effect == null) return false;
+        var code = FormulaAutomaticInjector.executable(method);
+        if (site.producerIndex() < 0 || site.producerIndex() >= code.size()
+                || !(code.get(site.producerIndex()) instanceof MethodInsnNode consumer)) return false;
+        boolean actualConsumer = FormulaConsumptionModel.classify(repository, consumer).stream().anyMatch(point ->
+                point.proof() == FormulaConsumptionModel.Proof.EFFECT_EVENT && point.kind() == site.kind() && point.argument() == site.argumentIndex());
+        if (!actualConsumer) return false;
+        var flow = FormulaDataFlow.analyze(repository, owner, method);
+        return flow.successful() && flow.reachable(consumer) && site.argumentIndex() < flow.arguments(consumer).size()
+                && eventEffectInput(repository, flow, flow.arguments(consumer).get(site.argumentIndex()), consumer, effect, new ArrayList<>()) == site.contextSlot();
+    }
+
+    private static String eventSourceKey(FormulaAutomaticSites.Site site) {
+        return site.definition().spellClassName() + '#' + site.owner() + '#' + site.methodName() + site.methodDescriptor()
+                + ':' + site.producerIndex() + ':' + site.methodFingerprint() + ':' + site.argumentIndex() + ':' + site.kind() + ':' + site.contextSlot();
     }
 
     static Map<String, String> inputTypes(FormulaAutomaticSites.Site site) {

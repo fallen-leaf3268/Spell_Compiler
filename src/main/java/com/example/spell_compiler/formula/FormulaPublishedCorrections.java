@@ -32,6 +32,17 @@ public final class FormulaPublishedCorrections {
         return Set.of(SPELL.replace('/', '.'), ORB.replace('/', '.'));
     }
 
+    public static boolean compatible(FormulaClassRepository repository) {
+        try { validate(repository); return true; }
+        catch (IllegalArgumentException unsupported) { return false; }
+    }
+
+    public static boolean applyIfCompatible(String owner, ClassNode source) {
+        if (!targetClasses().contains(owner.replace('/', '.'))) return false;
+        try { apply(owner, source); return true; }
+        catch (IllegalArgumentException unsupported) { return false; }
+    }
+
     public static void validate(FormulaClassRepository repository) {
         for (String owner : targetClasses()) {
             var source = repository.classNode(owner.replace('.', '/'));

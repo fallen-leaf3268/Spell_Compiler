@@ -123,7 +123,7 @@ public final class FormulaDamageTooltips {
         enter.add(new VarInsnNode(Opcodes.ALOAD, 2));
         enter.add(new MethodInsnNode(Opcodes.INVOKESTATIC, OWNER, "begin", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;", false));
         enter.add(new VarInsnNode(Opcodes.ASTORE, local));
-        method.instructions.insert(enter);
+        FormulaCastContext.insertAtBodyStart(method, enter);
         rows.forEach((call, components) -> {
             InsnList mark = new InsnList();
             for (String component : components) {
@@ -141,7 +141,7 @@ public final class FormulaDamageTooltips {
             exit.add(new VarInsnNode(Opcodes.ILOAD, 1));
             exit.add(new VarInsnNode(Opcodes.ALOAD, 2));
             exit.add(new MethodInsnNode(Opcodes.INVOKESTATIC, OWNER, "finish", "(Ljava/util/List;Ljava/util/Map;Ljava/lang/Object;ILjava/lang/Object;)Ljava/util/List;", false));
-            method.instructions.insertBefore(instruction, exit);
+            FormulaCastContext.insertBeforeReturnCleanup(method, instruction, exit);
         }
         method.maxStack += 8;
         ClassNode copy = new ClassNode();

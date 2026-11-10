@@ -6,8 +6,12 @@
   "plugin": "com.example.spell_compiler.formula.FormulaFixedMixinPlugin",
   "mixins": [
     "FormulaBaseSpellMixin",
+    "FormulaExplosionMixin",
     "FormulaSacrificeMixin",
     "FormulaNumberFormattingMixin",
+    "FormulaPoisonMixin",
+    "FormulaLifestealMixin",
+    "FormulaLifestealMixin$Consumer",
     "FormulaConsumerMixin$EffectData",
     "FormulaConsumerMixin$Attributes",
     "FormulaConsumerMixin$Synchronization",

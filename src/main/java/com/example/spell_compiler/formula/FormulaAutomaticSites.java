@@ -134,9 +134,20 @@ public final class FormulaAutomaticSites {
         diagnostics.addAll(effects.diagnostics());
         diagnostics.addAll(entities.diagnostics());
         var scopes = new java.util.ArrayList<>(direct.scopes());
-        scopes.addAll(FormulaEntityFlow.effectScopes(repository, spellClassName, entities.captures()));
+        var captures = new java.util.LinkedHashSet<>(entities.captures());
+        var explosions = FormulaExplosionBindings.register(repository, spellClassName, sites);
+        captures.addAll(explosions.captures());
+        diagnostics.addAll(explosions.diagnostics());
+        captures.addAll(FormulaEntityFlow.contextualEffectCaptures(repository, spellClassName));
+        var publications = FormulaEntityFlow.entityEffectPublications(repository, spellClassName);
+        if (!publications.publications().isEmpty()) {
+            captures.addAll(publications.parentCaptures());
+            publications.publications().forEach(publication -> captures.add(publication.capture()));
+        }
+        scopes.addAll(FormulaEntityFlow.effectScopes(repository, spellClassName, List.copyOf(captures)));
+        scopes.addAll(FormulaCastContext.contextualRoots(repository, spellClassName));
         return FormulaUnifiedAnalysis.finish(repository, FormulaUnifiedAnalysis.effectEvents(repository,
-                new Scan(spellClassName.replace('/', '.'), sites, diagnostics, entities.captures(), scopes.stream().distinct().toList()), reservedAliases),
+                new Scan(spellClassName.replace('/', '.'), sites, diagnostics, List.copyOf(captures), scopes.stream().distinct().toList()), reservedAliases),
                 exposedMethods);
     }
 
@@ -205,6 +216,7 @@ public final class FormulaAutomaticSites {
         var targets = new java.util.HashSet<>(INDEX.byOwner().keySet());
         targets.addAll(FormulaEntityFlow.captureTargets());
         targets.addAll(FormulaCastContext.targetClasses());
+        targets.addAll(FormulaExplosionBindings.targetClasses());
         return Set.copyOf(targets);
     }
 
